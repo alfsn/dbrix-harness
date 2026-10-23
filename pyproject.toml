@@ -1,0 +1,21 @@
+[project]
+name = "dbrix-harness"
+version = "0.1.0"
+description = "Local Databricks medallion sandbox and AST execution harness (v0)"
+requires-python = ">=3.12"
+dependencies = [
+    "delta-spark>=4.4.1",
+    "deltalake>=1.6.6",
+    "duckdb>=2.0.0",
+    "pandas>=3.1.0",
+    "pyarrow>=26.0.0",
+    "pydantic>=2.14.1",
+    "pyspark>=4.2.0",
+    "sqlglot>=30.24.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+]
