@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & linting
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# DuckDB & Delta Lake / Local Catalogs
+*.duckdb
+*.duckdb.wal
+prod_catalog/
+sandbox_catalog/
+spark-warehouse/
+derby.log
+metastore_db/
+
+# Environment & IDE
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+.DS_Store
