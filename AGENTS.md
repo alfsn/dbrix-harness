@@ -6,9 +6,9 @@ All agents working in this repository must follow these engineering and communic
 
 ### 1. The Best Code is No Code
 Every line of code is a liability to read, test, debug, and maintain.
-- **Delete before you add:** Always ask if a requirement can be met by deleting code, simplifying a flow, or using built-in features (e.g., native DuckDB, `delta-rs`, Python `ast` / `sqlglot`, standard library).
-- **Build only what is needed now (YAGNI):** Implement only what [v0_spec.md](file:///home/alfred/github/dbrix-harness/v0_spec.md) explicitly requires. Do not add "future-proof" hooks, extra config flags, abstract base classes for single implementations, or unused parameters.
-- **Use SQL over Python loops:** Use DuckDB queries or simple data structures instead of multi-line loops wherever possible.
+- **Delete before you add:** Always ask if a requirement can be met by deleting code, simplifying a flow, or using built-in features (e.g., built-in Spark SQL, `delta-spark`, Python `ast` / `sqlglot`, standard library).
+- **Build only what is needed now (YAGNI):** Implement only what [full_spec.md](file:///home/alfred/github/dbrix-harness/full_spec.md) explicitly requires. Do not add "future-proof" hooks, extra config flags, abstract base classes for single implementations, or unused parameters.
+- **Use SQL over Python loops:** Use Spark SQL, DataFrame expressions, or simple data structures instead of multi-line loops wherever possible.
 - **Keep it small and direct:** Avoid wrapper classes or pass-through functions that only add indirection.
 
 ### 2. Be DRY (Don't Repeat Yourself)
@@ -19,7 +19,7 @@ Every piece of knowledge must live in one place.
 
 ### 3. Be SOLID (Pragmatically Applied)
 Keep components decoupled and testable without adding boilerplate:
-- **S — Single Responsibility:** Each phase in [v0_spec.md](file:///home/alfred/github/dbrix-harness/v0_spec.md) (Generator, Downsampler, Security/AST Inspector, Rewriter/Executor, Lifecycle Manager) does one job and has one reason to change.
+- **S — Single Responsibility:** Each phase in [full_spec.md](file:///home/alfred/github/dbrix-harness/full_spec.md) (Generator, Downsampler, Security/AST Inspector, Rewriter/Executor, Lifecycle Manager) does one job and has one reason to change.
 - **O — Open/Closed:** Write rules (like AST security checks or sampling strategies) as simple data or functions so new rules can be added without rewriting the core engine.
 - **L — Liskov Substitution:** Swappable parts must take the exact same inputs and return the exact same outputs without hidden side effects.
 - **I — Interface Segregation:** Pass only what a function actually needs (e.g., a `Path` or a single setting, not a whole global config object).
@@ -28,7 +28,7 @@ Keep components decoupled and testable without adding boilerplate:
 ### Priority Rule
 When principles conflict, follow this order:
 > **No Code > DRY > SOLID**
-> Never build a class hierarchy (SOLID) or a complex helper (DRY) when a 10-line function using the standard library or DuckDB solves the problem.
+> Never build a class hierarchy (SOLID) or a complex helper (DRY) when a 10-line function using the standard library or Spark SQL solves the problem.
 
 ## Communication & Workflow Rules
 
