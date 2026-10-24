@@ -49,3 +49,5 @@ metastore_db/
 .idea/
 *.swp
 .DS_Store
+dbrix.toml
+.pytest_tmp/

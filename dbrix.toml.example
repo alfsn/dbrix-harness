@@ -1,0 +1,10 @@
+# Copy to dbrix.toml to override defaults from src/dbrix/config.py.
+prod_catalog_dir = "./prod_catalog"
+manifest         = "./manifests/influencer_marketing.yaml"
+
+[generator]
+seed  = 42
+scale = 1
+
+[executor]
+image = "dbrix-spark:0.1"

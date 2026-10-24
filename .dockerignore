@@ -1,0 +1,6 @@
+.git
+.venv
+prod_catalog
+sandbox_catalog
+tests
+**/__pycache__

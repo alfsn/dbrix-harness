@@ -1,0 +1,248 @@
+# Influencer marketing domain. Source of truth for the generator, sampler, rewriter, and catalog docs.
+#
+# Generators (`gen:`), all deterministic (hash of seed, table, column, row):
+#   uuid | company | person_name | text          named generators
+#   {range: [lo, hi], skew: s}                     number in [lo, hi); skew > 1 favours lo
+#   {choice: [...], weights: [...]}                one value from the list
+#   {between: [date, date]}                        date or timestamp in the range
+#   {parent: col}                                  copy a column of the `rows_per_parent` parent row
+#   {sql: "expr"}                                  Spark SQL over this row's columns, `parent.<col>`, and `_k`
+#                                                  (the child's index under its parent)
+# FK columns without `gen:` are picked from the referenced table (`skew`, `match` on the FK).
+# `null_fraction` makes that share of a column's values null.
+
+catalog: prod_catalog
+default_anchor: { table: silver.brands, key: brand_id }
+
+tables:
+  # ---------------------------------------------------------------- silver
+  silver.brands:
+    layer: silver
+    description: Brands (customers) running influencer campaigns.
+    primary_key: [brand_id]
+    rows: 100
+    columns:
+      brand_id:   { type: string, gen: uuid, description: Brand identifier }
+      name:       { type: string, gen: company }
+      industry:   { type: string, gen: { choice: [beauty, fashion, gaming, food, tech, travel] } }
+      country:    { type: string, gen: { choice: [US, GB, DE, FR, ES, IT, BR, MX, AR, CA, AU, JP, KR, IN] } }
+      created_at: { type: timestamp, gen: { between: [2018-01-01, 2024-01-01] } }
+
+  silver.campaigns:
+    layer: silver
+    description: Marketing campaigns run by a brand.
+    primary_key: [campaign_id]
+    foreign_keys:
+      - { columns: [brand_id], references: silver.brands(brand_id) }
+    rows_per_parent: { parent: silver.brands, min: 5, max: 25 }
+    columns:
+      campaign_id: { type: string, gen: uuid }
+      brand_id:    { type: string, gen: { parent: brand_id } }
+      name:        { type: string, gen: { sql: "concat(parent.name, ' ', objective, ' #', _k + 1)" } }
+      objective:   { type: string, gen: { choice: [awareness, engagement, conversions, launch] } }
+      budget_usd:  { type: "decimal(12,2)", gen: { range: [5000, 250000], skew: 2 } }
+      start_date:  { type: date, gen: { between: [2024-01-01, 2026-08-31] } }
+      end_date:    { type: date, gen: { sql: "date_add(start_date, 14 + cast(budget_usd / 5000 as int))" } }
+      status:      { type: string, gen: { sql: "CASE WHEN end_date < DATE'2026-09-30' THEN 'completed' ELSE 'active' END" } }
+
+  silver.creators:
+    layer: silver
+    description: Content creators (influencers).
+    primary_key: [creator_id]
+    rows: 5000
+    columns:
+      creator_id:       { type: string, gen: uuid }
+      display_name:     { type: string, gen: person_name }
+      country:          { type: string, gen: { choice: [US, GB, DE, FR, ES, IT, BR, MX, AR, CA, AU, JP, KR, IN] } }
+      primary_category: { type: string, gen: { choice: [beauty, fashion, gaming, food, tech, travel, fitness, lifestyle] } }
+      tier:             { type: string, gen: { choice: [nano, micro, mid, macro, mega], weights: [50, 30, 12, 6, 2] } }
+      joined_at:        { type: timestamp, gen: { between: [2015-01-01, 2024-06-01] } }
+
+  silver.social_accounts:
+    layer: silver
+    description: A creator's account on one social platform. 1-4 accounts per creator.
+    primary_key: [account_id]
+    foreign_keys:
+      - { columns: [creator_id], references: silver.creators(creator_id) }
+    rows_per_parent: { parent: silver.creators, min: 1, max: 4 }
+    columns:
+      account_id: { type: string, gen: uuid }
+      creator_id: { type: string, gen: { parent: creator_id } }
+      platform:   { type: string, gen: { choice: [instagram, tiktok, youtube, x, twitch], weights: [35, 30, 20, 10, 5] } }
+      handle:     { type: string, gen: { sql: "concat(lower(replace(parent.display_name, ' ', '_')), pmod(xxhash64(account_id), 1000))" } }
+      followers:  { type: bigint, gen: { range: [500, 5000000], skew: 4 } }
+      created_at: { type: timestamp, gen: { between: [2015-01-01, 2024-06-01] } }
+
+  silver.campaign_creators:
+    layer: silver
+    description: Creators contracted for a campaign, with fee and status.
+    primary_key: [campaign_id, creator_id]
+    foreign_keys:
+      - { columns: [campaign_id], references: silver.campaigns(campaign_id) }
+      - { columns: [creator_id], references: silver.creators(creator_id), skew: 2 }
+    rows_per_parent: { parent: silver.campaigns, min: 2, max: 14 }
+    columns:
+      campaign_id:   { type: string, gen: { parent: campaign_id } }
+      creator_id:    { type: string }
+      fee_usd:       { type: "decimal(12,2)", gen: { range: [200, 50000], skew: 3 } }
+      status:        { type: string, gen: { choice: [invited, active, completed, declined], weights: [5, 25, 60, 10] } }
+      contracted_at: { type: timestamp, gen: { sql: "timestamp(date_sub(parent.start_date, 7))" } }
+
+  silver.posts:
+    layer: silver
+    description: Posts published by creators. Posts without a campaign are organic.
+    primary_key: [post_id]
+    foreign_keys:
+      - { columns: [campaign_id], references: silver.campaigns(campaign_id) }
+      # the account belongs to the creator contracted for this campaign
+      - { columns: [account_id], references: silver.social_accounts(account_id), match: { creator_id: parent.creator_id } }
+    rows_per_parent: { parent: silver.campaign_creators, min: 4, max: 30 }
+    columns:
+      post_id:      { type: string, gen: uuid }
+      campaign_id:  { type: string, gen: { parent: campaign_id }, null_fraction: 0.1, description: Null for organic posts }
+      account_id:   { type: string }
+      content_type: { type: string, gen: { choice: [image, video, reel, story, short, live], weights: [25, 20, 25, 15, 10, 5] } }
+      caption:      { type: string, gen: text }
+      posted_at:    { type: timestamp, gen: { sql: "timestampadd(SECOND, pmod(xxhash64(post_id), 5184000), parent.contracted_at)" } }
+
+  silver.post_metrics_daily:
+    layer: silver
+    description: Daily engagement metrics per post, starting on the day it was posted.
+    primary_key: [post_id, metric_date]
+    foreign_keys:
+      - { columns: [post_id], references: silver.posts(post_id) }
+    rows_per_parent: { parent: silver.posts, min: 5, max: 15 }
+    columns:
+      post_id:     { type: string, gen: { parent: post_id } }
+      metric_date: { type: date, gen: { sql: "date_add(to_date(parent.posted_at), _k)" } }
+      impressions: { type: bigint, gen: { range: [100, 500000], skew: 3 } }
+      likes:       { type: bigint, gen: { sql: "cast(impressions * pmod(xxhash64(post_id, metric_date, 'likes'), 800) / 10000 as bigint)" } }
+      comments:    { type: bigint, gen: { sql: "cast(likes * pmod(xxhash64(post_id, metric_date, 'comments'), 100) / 1000 as bigint)" } }
+      shares:      { type: bigint, gen: { sql: "cast(likes * pmod(xxhash64(post_id, metric_date, 'shares'), 150) / 1000 as bigint)" } }
+      saves:       { type: bigint, gen: { sql: "cast(likes * pmod(xxhash64(post_id, metric_date, 'saves'), 200) / 1000 as bigint)" } }
+
+  # ---------------------------------------------------------------- bronze
+  # Each Bronze table has ~3% duplicate events (same content, new event_id) and ~5% late arrivals.
+  bronze.raw_post_events:
+    layer: bronze
+    description: Raw post-published events as ingested. Contains duplicates and late arrivals.
+    primary_key: [event_id]
+    foreign_keys:
+      - { columns: [post_id], references: silver.posts(post_id) }
+    rows_per_parent: { parent: silver.posts, min: 1, max: 1 }
+    duplicate_fraction: 0.03
+    columns:
+      event_id:    { type: string, gen: uuid }
+      post_id:     { type: string, gen: { parent: post_id } }
+      event_ts:    { type: timestamp, gen: { sql: "parent.posted_at" } }
+      ingested_at: { type: timestamp, gen: { sql: "timestampadd(SECOND, CASE WHEN pmod(xxhash64(event_id), 100) < 5 THEN 86400 + pmod(xxhash64(event_id, 'late'), 518400) ELSE pmod(xxhash64(event_id, 'lag'), 600) END, event_ts)" } }
+      raw_payload: { type: string, description: "Original JSON, kept for realism, not used for keys", gen: { sql: "to_json(named_struct('post_id', parent.post_id, 'account_id', parent.account_id, 'campaign_id', parent.campaign_id, 'content_type', parent.content_type, 'caption', parent.caption, 'posted_at', parent.posted_at))" } }
+
+  bronze.raw_engagement_events:
+    layer: bronze
+    description: Raw engagement snapshots per post, as scraped. Contains duplicates and late arrivals.
+    primary_key: [event_id]
+    foreign_keys:
+      - { columns: [post_id], references: silver.posts(post_id) }
+    rows_per_parent: { parent: silver.posts, min: 1, max: 3 }
+    duplicate_fraction: 0.03
+    columns:
+      event_id:    { type: string, gen: uuid }
+      post_id:     { type: string, gen: { parent: post_id } }
+      snapshot_ts: { type: timestamp, gen: { sql: "timestampadd(HOUR, _k * 24 + pmod(xxhash64(event_id), 24), parent.posted_at)" } }
+      ingested_at: { type: timestamp, gen: { sql: "timestampadd(SECOND, CASE WHEN pmod(xxhash64(event_id), 100) < 5 THEN 86400 + pmod(xxhash64(event_id, 'late'), 518400) ELSE pmod(xxhash64(event_id, 'lag'), 600) END, snapshot_ts)" } }
+      raw_payload: { type: string, description: "Original JSON, kept for realism, not used for keys", gen: { sql: "to_json(named_struct('post_id', post_id, 'likes', pmod(xxhash64(event_id, 'likes'), 50000), 'comments', pmod(xxhash64(event_id, 'comments'), 2000), 'shares', pmod(xxhash64(event_id, 'shares'), 3000)))" } }
+
+  bronze.raw_creator_profiles:
+    layer: bronze
+    description: Scraped creator profile snapshots. Contains duplicates and late arrivals.
+    primary_key: [event_id]
+    foreign_keys:
+      - { columns: [creator_id], references: silver.creators(creator_id) }
+    rows_per_parent: { parent: silver.creators, min: 1, max: 3 }
+    duplicate_fraction: 0.03
+    columns:
+      event_id:    { type: string, gen: uuid }
+      creator_id:  { type: string, gen: { parent: creator_id } }
+      scraped_at:  { type: timestamp, gen: { between: [2024-01-01, 2026-09-30] } }
+      ingested_at: { type: timestamp, gen: { sql: "timestampadd(SECOND, CASE WHEN pmod(xxhash64(event_id), 100) < 5 THEN 86400 + pmod(xxhash64(event_id, 'late'), 518400) ELSE pmod(xxhash64(event_id, 'lag'), 600) END, scraped_at)" } }
+      raw_payload: { type: string, description: "Original JSON, kept for realism, not used for keys", gen: { sql: "to_json(named_struct('creator_id', parent.creator_id, 'display_name', parent.display_name, 'country', parent.country, 'tier', parent.tier, 'follower_count', pmod(xxhash64(event_id), 1000000)))" } }
+
+  # ---------------------------------------------------------------- gold
+  gold.campaign_performance:
+    layer: gold
+    description: Posts, impressions, engagements, engagement rate, and cost per engagement per campaign.
+    primary_key: [campaign_id]
+    transform: |
+      WITH post_totals AS (
+        SELECT p.campaign_id, p.post_id,
+               SUM(m.impressions) AS impressions,
+               SUM(m.likes + m.comments + m.shares + m.saves) AS engagements
+        FROM prod_catalog.silver.posts p
+        LEFT JOIN prod_catalog.silver.post_metrics_daily m ON m.post_id = p.post_id
+        WHERE p.campaign_id IS NOT NULL
+        GROUP BY p.campaign_id, p.post_id
+      ),
+      fees AS (
+        SELECT campaign_id, SUM(fee_usd) AS total_fees_usd
+        FROM prod_catalog.silver.campaign_creators
+        WHERE status <> 'declined'
+        GROUP BY campaign_id
+      )
+      SELECT c.campaign_id, c.brand_id, c.name AS campaign_name,
+             COUNT(pt.post_id) AS total_posts,
+             COALESCE(SUM(pt.impressions), 0) AS total_impressions,
+             COALESCE(SUM(pt.engagements), 0) AS total_engagements,
+             try_divide(SUM(pt.engagements), SUM(pt.impressions)) AS engagement_rate,
+             COALESCE(f.total_fees_usd, 0) AS total_fees_usd,
+             try_divide(f.total_fees_usd, SUM(pt.engagements)) AS cost_per_engagement
+      FROM prod_catalog.silver.campaigns c
+      LEFT JOIN post_totals pt ON pt.campaign_id = c.campaign_id
+      LEFT JOIN fees f ON f.campaign_id = c.campaign_id
+      GROUP BY c.campaign_id, c.brand_id, c.name, f.total_fees_usd
+
+  gold.creator_brand_summary:
+    layer: gold
+    description: Campaigns, posts, engagements, and fees per creator per brand.
+    primary_key: [creator_id, brand_id]
+    transform: |
+      WITH contracts AS (
+        SELECT cc.creator_id, c.brand_id,
+               COUNT(DISTINCT cc.campaign_id) AS campaigns,
+               SUM(CASE WHEN cc.status <> 'declined' THEN cc.fee_usd ELSE 0 END) AS total_fees_usd
+        FROM prod_catalog.silver.campaign_creators cc
+        JOIN prod_catalog.silver.campaigns c ON c.campaign_id = cc.campaign_id
+        GROUP BY cc.creator_id, c.brand_id
+      ),
+      engagement AS (
+        SELECT a.creator_id, c.brand_id,
+               COUNT(DISTINCT p.post_id) AS total_posts,
+               SUM(m.impressions) AS total_impressions,
+               SUM(m.likes + m.comments + m.shares + m.saves) AS total_engagements
+        FROM prod_catalog.silver.posts p
+        JOIN prod_catalog.silver.social_accounts a ON a.account_id = p.account_id
+        JOIN prod_catalog.silver.campaigns c ON c.campaign_id = p.campaign_id
+        LEFT JOIN prod_catalog.silver.post_metrics_daily m ON m.post_id = p.post_id
+        GROUP BY a.creator_id, c.brand_id
+      )
+      SELECT k.creator_id, k.brand_id, k.campaigns,
+             COALESCE(e.total_posts, 0) AS total_posts,
+             COALESCE(e.total_impressions, 0) AS total_impressions,
+             COALESCE(e.total_engagements, 0) AS total_engagements,
+             k.total_fees_usd
+      FROM contracts k
+      LEFT JOIN engagement e ON e.creator_id = k.creator_id AND e.brand_id = k.brand_id
+
+  gold.brand_daily_engagement:
+    layer: gold
+    description: Daily impressions and engagements per brand, over campaign posts.
+    primary_key: [brand_id, metric_date]
+    transform: |
+      SELECT c.brand_id, m.metric_date,
+             COUNT(DISTINCT m.post_id) AS active_posts,
+             SUM(m.impressions) AS impressions,
+             SUM(m.likes + m.comments + m.shares + m.saves) AS engagements
+      FROM prod_catalog.silver.post_metrics_daily m
+      JOIN prod_catalog.silver.posts p ON p.post_id = m.post_id
+      JOIN prod_catalog.silver.campaigns c ON c.campaign_id = p.campaign_id
+      GROUP BY c.brand_id, m.metric_date
