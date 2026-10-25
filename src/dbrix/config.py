@@ -32,6 +32,14 @@ JOB_ERROR_LINES = 20
 # File and dir names inside a catalog dir (prod or sandbox).
 METASTORE_DIR = "_metastore"
 CATALOG_META_FILE = "_catalog_meta.json"
+RESULTS_DIR = "_results"  # in a sandbox dir; the agent sees it as RESULTS_PATH (§8.4)
+RESULTS_PATH = "/results"
+
+# Executor (§6.3).
+SANDBOX_LABEL = "dbrix.sandbox_id"
+EXECUTOR_START_TIMEOUT = 300  # seconds until the runtime's ready line (Spark start)
+MAX_RESPONSE_BYTES = 1_000_000  # one response line from the untrusted executor
+OUTPUT_LIMIT = 8192  # characters of stdout and of stderr kept per run
 
 
 class _Section(BaseModel):

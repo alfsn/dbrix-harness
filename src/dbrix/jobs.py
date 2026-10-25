@@ -8,6 +8,9 @@ import docker
 
 from dbrix.config import JOB_ERROR_LINES
 
+# Every dbrix container runs with the network off. With no network, the default container hostname does not resolve.
+NO_NETWORK: dict[str, Any] = {"network_mode": "none", "hostname": "localhost"}
+
 
 class JobError(Exception):
     pass
@@ -32,8 +35,7 @@ def run_job(
         image,
         command,
         volumes=volumes,
-        network_mode="none",
-        hostname="localhost",  # with no network, the default container hostname does not resolve
+        **NO_NETWORK,
         **docker_kwargs,
     )
     try:
