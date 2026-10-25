@@ -456,6 +456,11 @@ All rewriting happens **inside the container, at runtime**. The host never rewri
 
 The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `DataFrameWriter.saveAsTable`, `DataFrameWriter.insertInto`, `DataFrame.writeTo`, and the SQL-expression entry points `F.expr`, `DataFrame.selectExpr`, `DataFrame.filter`, and `DataFrame.where` (string arguments only; these get the §5.3 function and `_metadata` rules) before agent code runs. `run_sql` runs each statement through the wrapped `spark.sql`, so both tools take the same path. Gold `transform`s in the jobs container use the same rewriter.
 
+- **Lowest entry point only.** It patches the classes, at the method the others call (for example `spark.table` calls `DataFrameReader.table`, so only that is patched). Each name is checked and rewritten exactly once; a test proves it.
+- **Path methods are blocked at runtime too.** The reader and writer path methods (§5.4 `PATH_METHODS`) always raise. This closes the alias gap of §5.5 (`w = df.write; w.save(p)`), so `allow_writes` holds for every write.
+- **`spark.sql` takes only the query string.** Extra arguments (`args=`, `{name}` keyword formatting) are blocked with the hint "use one SQL string", because they hide table names from the rewrite.
+- **The check function is passed in at startup** (`policy.check` by default). The red-team containment tests (§11.3) start the runtime with a no-op check instead; the agent has no way to choose it.
+
 For each SQL string (parsed with sqlglot) or table name, the wrapper:
 1. runs `policy.check` on it (§5.2), and blocks writes if `allow_writes` is false;
 2. resolves every table reference:
@@ -464,6 +469,7 @@ For each SQL string (parsed with sqlglot) or table name, the wrapper:
 |---|---|
 | `prod_catalog.<schema>.<table>`, schema in `bronze`/`silver`/`gold` | rewritten to `<schema>.<table>`. If the table doesn't exist, Spark's own "table not found" error is returned, reverse-mapped |
 | 1-part name that is a CTE in the same statement, or a temp view in the session (from this call or an earlier one) | left as is |
+| 1-part target of `CREATE TEMP VIEW` or `DROP VIEW` | left as is (the view may not exist yet) |
 | any other 1-part name, any 2-part name | blocked, with a hint showing the 3-part form |
 | any other catalog or schema | blocked |
 
@@ -492,9 +498,13 @@ There is one engine, **local PySpark 4.2 with delta-spark**, and two tools:
   - Derby allows one process at a time. The sampler (jobs container) finishes before the executor starts, which the creation lock guarantees (§9.5).
   - Cost: a few seconds added to Spark startup.
   - Hive support and Delta together must be checked against the pinned versions when building the image.
+  - `spark.sql.sources.default=delta`, so `CREATE TABLE … AS` and `saveAsTable` without a format make Delta tables, as on Databricks.
 - **Protocol:** newline-delimited JSON on the container's stdin/stdout, attached by the host through the Docker SDK. There are no sockets and no network.
   - Request: `{run_id, language, code, allow_writes}`. Response: a `RunResult` (§6.4).
-  - At startup the runtime moves the protocol channel to a private copy of file descriptor 1, and points descriptor 1 at a capture file in `/tmp`. Nothing the agent prints can reach the protocol channel by accident.
+  - At startup, **before Spark starts**, the runtime moves the protocol channel to a private copy of file descriptor 1, and points descriptor 1 at descriptor 2 (stderr, kept by `docker logs`). Nothing the agent or the JVM prints can reach the protocol channel by accident, and no file fills `/tmp`.
+  - After Spark starts, the runtime sends one `{"ready": true}` line. The client waits for it before the first request; startup does not count toward `run_timeout`.
+  - The client attaches to stdin/stdout **before** starting the container and keeps that connection, so no line is lost or replayed.
+  - `run_id` must match `[A-Za-z0-9_-]{1,128}`, because it names the result file.
   - The host treats every response as untrusted: it validates it with pydantic and rejects lines larger than `MAX_RESPONSE_BYTES` (`config.py`).
 - **Logs:** Spark's log level is `WARN`. Python stdout and stderr are captured per run into `RunResult` (8 KB each). JVM logs go to the container's stderr and are kept by Docker (`docker logs <container>`), with no extra code.
 - **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is killed and restarted, and the run is recorded as `TIMEOUT`. Tables survive (metastore); temp views and cached data are lost.
@@ -532,10 +542,10 @@ The agent should never see that it is not on Databricks `prod_catalog`. The plac
 
 | Leak | Handling |
 |---|---|
-| Table names in errors and stack traces (`silver.posts`, `spark_catalog.silver.posts`) | Reverse-mapped to `prod_catalog.silver.posts`. Stack frames from the dbrix runtime are removed |
-| Paths (`/sandbox/silver/posts`, `/sandbox/...`) in any text | `/sandbox/<schema>/<table>` → `prod_catalog.<schema>.<table>`; any other `/sandbox` path → `<sandbox>` |
+| Table names in errors and stack traces (`silver.posts`, `spark_catalog.silver.posts`, and Spark's quoted form `` `silver`.`posts` ``) | Reverse-mapped to `prod_catalog.silver.posts` (quoted names stay quoted). Errors carry Spark's message (no JVM stack trace by default); a Python traceback shows only frames of the agent's own code (compiled as `<agent>`) |
+| Paths (`/sandbox/silver/posts`, `file:/sandbox/...`) in any text | `/sandbox/<schema>/<table>` → `prod_catalog.<schema>.<table>`; any other `/sandbox` path → `<sandbox>` |
 | Output rows of `SHOW`, `DESCRIBE` (incl. `DETAIL`, `HISTORY`, `EXTENDED`), `EXPLAIN` | The same reverse mapping is applied to every string value in these results, so `SHOW CATALOGS` returns `prod_catalog` and locations hide sandbox paths |
-| stdout and stderr | Same reverse mapping |
+| stdout and stderr | Same reverse mapping, always, even when the agent prints data rows (rare false matches are accepted) |
 | `current_catalog()` | Rewritten to `'prod_catalog'` (§6.1) |
 | `input_file_name()` and related, `_metadata` column | Blocked by the policy (§5.3), with a hint |
 | Catalog docs (`/catalog/`) | Always generated with prod names |
@@ -808,7 +818,7 @@ ttl_seconds = 86400
 ### 11.3 Red team (must all fail to touch prod or escape)
 `getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `df.write.saveAsTable(…, path="/x")`, `df.write.options(**{"path": "/x"})`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
 
-For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own.
+For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own. The containment test sends requests straight to the executor client (no middleware) and starts the runtime with a no-op check (§6.1), with the same isolation flags as a normal executor.
 
 ### 11.4 Acceptance (v0 is done when)
 1. `python -m dbrix.generator` at scale 1 finishes in under 2 min and passes integrity checks.
@@ -899,3 +909,11 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 40 | `EXPLAIN` | read | `EXPLAIN X` is treated like X (a write inside needs approval though nothing runs). Less code; errs safe |
 | 41 | `DROP VIEW` | — | 3-part name: write `DROP_VIEW`; 1-part (temp view): read. Approval shows the statement, not the label |
 | 42 | `TableRef` | — | Lowercase, unquoted dotted name (Spark names ignore case) |
+| 43 | Wrapper patch points | list of methods | Patch only the lowest entry point, on the classes, so each name is rewritten once. Path methods raise at runtime too, so aliases can't write without approval |
+| 44 | `spark.sql` arguments | — | Only the query string; `args=` and keyword formatting are blocked |
+| 45 | Shared statement parsing | — | Check and rewrite use one `parse_statement` (sqlglot plus the `SHOW`/`EXPLAIN`/`DESCRIBE DETAIL` forms sqlglot can't parse) |
+| 46 | Stray fd 1 output | capture file in `/tmp` | Pointed at stderr (`docker logs`): same protection, nothing fills `/tmp` |
+| 47 | Default table format | — | `spark.sql.sources.default=delta`, as on Databricks |
+| 48 | Reverse mapping of stdout | — | Always applied (option A); quoted names and `file:` paths are covered |
+| 49 | Policy-disabled red-team runs | — | The check function is passed to the runtime at startup; tests pass a no-op one. No flag the agent can reach |
+| 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
