@@ -8,7 +8,7 @@ from pyspark.sql import functions as F
 
 from dbrix.config import DELTA_JARS, METASTORE_DIR, SPARK_DRIVER_MEMORY, SPARK_SHUFFLE_PARTITIONS
 from dbrix.manifest import Manifest
-from dbrix.rewrite import to_sandbox_sql
+from dbrix.rewrite import rewrite_sql
 
 
 def create_session(catalog_dir: str) -> SparkSession:
@@ -57,5 +57,6 @@ def write_gold(spark: SparkSession, manifest: Manifest) -> None:
     """Run each Gold transform over the Bronze and Silver tables in the metastore and save the result."""
     for name, t in manifest.tables.items():
         if t.transform:
-            spark.sql(to_sandbox_sql(t.transform, manifest.catalog)).write.format("delta").saveAsTable(name)
+            sql = rewrite_sql(t.transform, manifest.catalog, lambda _: False)
+            spark.sql(sql).write.format("delta").saveAsTable(name)
             print(f"computed {name}", flush=True)

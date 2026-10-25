@@ -182,11 +182,11 @@ SANDBOX_CHECKS = """
 import json
 from pyspark.sql import functions as F
 from dbrix.manifest import load_manifest
-from dbrix.rewrite import to_sandbox_sql
+from dbrix.rewrite import rewrite_sql
 from pathlib import Path
 m = load_manifest(Path("/repo/manifests/influencer_marketing.yaml"))
 def gold_diff(name, t):
-    expected, actual = spark.sql(to_sandbox_sql(t.transform, m.catalog)), spark.table(name)
+    expected, actual = spark.sql(rewrite_sql(t.transform, m.catalog, lambda _: False)), spark.table(name)
     return expected.exceptAll(actual).count() + actual.exceptAll(expected).count()
 print(json.dumps({
     "seed_of_ids": spark.range(1).select(F.xxhash64(F.lit("agent"), F.lit("s1"))).first()[0],
