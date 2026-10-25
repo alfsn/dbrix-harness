@@ -11,7 +11,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from dbrix.config import CATALOG_META_FILE, SamplingConfig
+from dbrix.config import CATALOG_META_FILE, Layer, SamplingConfig
 from dbrix.policy.exceptions import SandboxSecurityException
 from dbrix.policy.sql import check_sql
 
@@ -89,7 +89,7 @@ class RowsPerParent(_Model):
 
 
 class Table(_Model):
-    layer: Literal["bronze", "silver", "gold"]
+    layer: Layer
     description: str | None = None
     primary_key: list[str]
     foreign_keys: list[ForeignKey] = []

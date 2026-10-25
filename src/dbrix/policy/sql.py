@@ -70,7 +70,7 @@ DESCRIBE_DETAIL = re.compile(r"DESC(?:RIBE)?\s+DETAIL\s+(?P<table>\S+)", re.IGNO
 COMMAND = re.compile(r"(?P<word>\w+)\s*(?P<rest>.*)", re.DOTALL)
 EXPLAIN_MODE = re.compile(r"(?:EXTENDED|CODEGEN|COST|FORMATTED)\s+", re.IGNORECASE)
 SHOW = re.compile(
-    r"(?:TABLES|SCHEMAS|DATABASES|CATALOGS)(?:\s+(?:IN|FROM)\s+(?P<schema>\S+))?(?:\s+(?:LIKE\s+)?'[^']*')?"
+    r"(?P<what>TABLES|SCHEMAS|DATABASES|CATALOGS)(?:\s+(?:IN|FROM)\s+(?P<schema>\S+))?(?:\s+(?:LIKE\s+)?'[^']*')?"
     r"|COLUMNS\s+(?:IN|FROM)\s+(?P<table>\S+)",
     re.IGNORECASE,
 )
@@ -118,17 +118,21 @@ def table_ref(table: exp.Table) -> TableRef:
     return ".".join(part.name.lower() for part in table.parts)
 
 
-def name_ref(name: str, location: Location | None = None) -> TableRef:
-    """The TableRef of a table name in a string (`spark.table("…")`, `SHOW COLUMNS IN …`), path rule applied."""
+def parse_table(name: str, location: Location | None = None) -> exp.Table:
+    """A table name in a string (`spark.table("…")`, `SHOW COLUMNS IN …`), path rule applied."""
     try:
         table = exp.to_table(name, dialect=DIALECT)
     except (ParseError, TokenError) as e:
         _blocked("SQL_PARSE_ERROR", f"the table name does not parse: {e}", location, name)
     _check_tree(table, location)
-    return table_ref(table)
+    return table
 
 
-def _tables(tree: exp.Expr) -> list[exp.Table]:
+def name_ref(name: str, location: Location | None = None) -> TableRef:
+    return table_ref(parse_table(name, location))
+
+
+def tables(tree: exp.Expr) -> list[exp.Table]:
     """Named tables in `tree`, without CTE names and table-valued functions."""
     ctes = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
     return [t for t in tree.find_all(exp.Table) if isinstance(t.this, exp.Identifier) and (t.db or t.name not in ctes)]
@@ -157,12 +161,33 @@ def _kind(stmt: exp.Expr) -> WriteKind | Literal["READ"] | None:
     return STATEMENTS.get((type(stmt), kind))
 
 
+def parse_statement(text: str, location: Location | None = None) -> exp.Expr:
+    """One statement as a tree. sqlglot keeps SHOW and EXPLAIN as `exp.Command`; DESCRIBE DETAIL is built here."""
+    try:
+        if m := DESCRIBE_DETAIL.fullmatch(text):
+            return exp.Describe(this=exp.to_table(m["table"], dialect=DIALECT), style="DETAIL")
+        return sqlglot.parse_one(text, dialect=DIALECT)
+    except (ParseError, TokenError) as e:
+        _blocked("SQL_PARSE_ERROR", f"the statement does not parse: {e}", location, text)
+
+
+def split_command(text: str) -> tuple[str, str]:
+    """An `exp.Command` statement -> (first word in upper case, the rest)."""
+    m = COMMAND.fullmatch(text)
+    return (m["word"].upper(), m["rest"]) if m else ("", text)
+
+
+def split_explain(rest: str) -> tuple[str, str]:
+    """The text after EXPLAIN -> (its mode word with trailing space, or "", the explained statement)."""
+    m = EXPLAIN_MODE.match(rest)
+    return (m[0], rest[m.end() :]) if m else ("", rest)
+
+
 def _check_command(text: str, location: Location, report: PolicyReport) -> None:
     """A statement sqlglot keeps as unparsed text: only EXPLAIN and a few SHOW forms are allowed."""
-    m = COMMAND.fullmatch(text)
-    word, rest = (m["word"].upper(), m["rest"]) if m else ("", text)
+    word, rest = split_command(text)
     if word == "EXPLAIN":  # treated like the statement it explains (§5.3)
-        return _check_statement(EXPLAIN_MODE.sub("", rest, count=1), location, report)
+        return _check_statement(split_explain(rest)[1], location, report)
     if word == "SHOW" and (m := SHOW.fullmatch(rest.strip())):
         if m["schema"] and "/" in m["schema"]:
             _blocked("SQL_PATH_SOURCE", "path-based sources and locations are not allowed", location, text, PATH_HINT)
@@ -173,13 +198,7 @@ def _check_command(text: str, location: Location, report: PolicyReport) -> None:
 
 
 def _check_statement(text: str, location: Location, report: PolicyReport) -> None:
-    try:
-        if m := DESCRIBE_DETAIL.fullmatch(text):
-            stmt: exp.Expr = exp.Describe(this=exp.to_table(m["table"], dialect=DIALECT), style="DETAIL")
-        else:
-            stmt = sqlglot.parse_one(text, dialect=DIALECT)
-    except (ParseError, TokenError) as e:
-        _blocked("SQL_PARSE_ERROR", f"the statement does not parse: {e}", location, text)
+    stmt = parse_statement(text, location)
     if isinstance(stmt, exp.Command):
         return _check_command(text, location, report)
     kind = _kind(stmt)
@@ -191,7 +210,7 @@ def _check_statement(text: str, location: Location, report: PolicyReport) -> Non
     target = stmt.find(exp.Table) if kind != READ or isinstance(stmt, (exp.Create, exp.Drop)) else None
     if kind != READ:
         report.writes.append(WriteOp(kind=kind, target=table_ref(target) if target else None, location=location))
-    report.reads |= {table_ref(t) for t in _tables(stmt) if t is not target}
+    report.reads |= {table_ref(t) for t in tables(stmt) if t is not target}
 
 
 def check_sql(sql: str) -> PolicyReport:

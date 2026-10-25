@@ -2,6 +2,7 @@
 
 import tomllib
 from pathlib import Path
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, model_validator
 
@@ -12,8 +13,14 @@ PROD_CATALOG_MOUNT = "/prod_catalog"
 MANIFEST_MOUNT = "/manifest.yaml"
 SANDBOX_MOUNT = "/sandbox"
 
+# The medallion layers; each is one schema in every catalog (§3, §6.1).
+Layer = Literal["bronze", "silver", "gold"]
+SCHEMAS: tuple[Layer, ...] = get_args(Layer)
+
 # agent_id and session_id: no `_`, so `agent_{agent_id}_{session_id}` splits back into one pair (§4.4).
 ID_PATTERN = r"[A-Za-z0-9-]{1,64}"
+# run_id names the result file `_results/<run_id>.csv` (§6.3).
+RUN_ID_PATTERN = r"[A-Za-z0-9_-]{1,128}"
 
 # Local Spark: data is small, so few shuffle partitions beat Spark's default of 200.
 SPARK_DRIVER_MEMORY = "2g"
@@ -52,6 +59,11 @@ class SamplingConfig(_Section):
 
 class ExecutorConfig(_Section):
     image: str = "dbrix-spark:0.1"
+    run_timeout: PositiveInt = 120  # seconds of running time per run
+    memory: str = "4g"
+    cpus: float = Field(default=2, gt=0)
+    preview_rows: PositiveInt = 50
+    result_file_max_rows: PositiveInt = 10000
 
 
 class Config(_Section):

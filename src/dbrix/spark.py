@@ -19,6 +19,7 @@ def create_session(catalog_dir: str) -> SparkSession:
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.sql.catalogImplementation", "hive")
+        .config("spark.sql.sources.default", "delta")  # as on Databricks
         .config("spark.sql.warehouse.dir", catalog_dir)
         .config(
             "spark.hadoop.javax.jdo.option.ConnectionURL",
