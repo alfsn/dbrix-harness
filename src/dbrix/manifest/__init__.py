@@ -8,12 +8,12 @@ from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
-import sqlglot
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
-from sqlglot import exp
 
 from dbrix.config import CATALOG_META_FILE, SamplingConfig
+from dbrix.policy.exceptions import SandboxSecurityException
+from dbrix.policy.sql import check_sql
 
 
 class ManifestError(ValueError):
@@ -202,18 +202,16 @@ def _validate_gold(m: Manifest, name: str, t: Table) -> list[str]:
     if t.transform is None:
         return [f"{name}: a Gold table needs a transform"]
     try:
-        tree = sqlglot.parse_one(t.transform, dialect="spark")
-    except sqlglot.errors.ParseError as e:
-        return [f"{name}: transform does not parse: {e}"]
-    errors = []
-    ctes = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
-    for ref in tree.find_all(exp.Table):
-        if not ref.db and ref.name in ctes:
-            continue
-        source = m.tables.get(f"{ref.db}.{ref.name}")
-        if ref.catalog != m.catalog or source is None or source.layer == "gold":
+        report = check_sql(t.transform)
+    except SandboxSecurityException as e:
+        return [f"{name}: transform {'does not parse' if e.rule_id == 'SQL_PARSE_ERROR' else 'is not allowed'}: {e}"]
+    errors = [f"{name}: transform writes ({w.kind}); it may only read" for w in report.writes]
+    for ref in sorted(report.reads):
+        catalog, _, table = ref.partition(".")
+        source = m.tables.get(table)
+        if catalog != m.catalog or source is None or source.layer == "gold":
             errors.append(
-                f"{name}: transform reads '{ref.sql(dialect='spark')}'; "
+                f"{name}: transform reads '{ref}'; "
                 f"use '{m.catalog}.<schema>.<table>' for a Bronze or Silver table of this manifest"
             )
     return errors
