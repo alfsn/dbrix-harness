@@ -7,7 +7,6 @@ depend on partitioning. A row key `_rk` is the range id, or a hash of the parent
 """
 
 import calendar
-import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,6 +19,7 @@ from dbrix.config import CATALOG_META_FILE
 from dbrix.integrity import check_integrity
 from dbrix.manifest import (
     BetweenGen,
+    CatalogMeta,
     ChoiceGen,
     Column,
     ForeignKey,
@@ -31,8 +31,7 @@ from dbrix.manifest import (
     load_manifest,
     manifest_hash,
 )
-from dbrix.rewrite import to_sandbox_sql
-from dbrix.spark import create_session
+from dbrix.spark import create_schemas, create_session, unit, write_gold
 
 ADJECTIVES = [
     "Bright",
@@ -156,11 +155,6 @@ WORDS = [
 ]
 
 Hash = Callable[..., SparkColumn]
-
-
-def unit(h: SparkColumn) -> SparkColumn:
-    """A 64-bit hash mapped onto [0, 1)."""
-    return F.shiftrightunsigned(h, 11) / float(2**53)
 
 
 def word(words: list[str], h: SparkColumn) -> SparkColumn:
@@ -294,31 +288,25 @@ def generate_table(spark: SparkSession, manifest: Manifest, name: str, seed: int
 
 
 def generate(spark: SparkSession, manifest: Manifest, catalog_dir: str, seed: int, scale: float) -> None:
-    for schema in sorted({name.split(".")[0] for name in manifest.tables}):
-        spark.sql(f"CREATE DATABASE IF NOT EXISTS {schema} LOCATION '{catalog_dir}/{schema}'")
+    create_schemas(spark, manifest, catalog_dir)
     for name in manifest.generation_order():
         generate_table(spark, manifest, name, seed, scale).write.format("delta").saveAsTable(name)
         print(f"generated {name}", flush=True)
-    for name, t in manifest.tables.items():
-        if t.transform:
-            spark.sql(to_sandbox_sql(t.transform, manifest.catalog)).write.format("delta").saveAsTable(name)
-            print(f"computed {name}", flush=True)
+    write_gold(spark, manifest)
 
 
 def main(manifest_path: Path, catalog_dir: str, seed: int, scale: float) -> None:
     manifest = load_manifest(manifest_path)
     spark = create_session(catalog_dir)
     generate(spark, manifest, catalog_dir, seed, scale)
-    check_integrity(spark, manifest)
-    meta = {
-        "manifest_hash": manifest_hash(manifest_path),
-        "seed": seed,
-        "scale": scale,
-        "table_versions": {
-            n: spark.sql(f"DESCRIBE HISTORY {n} LIMIT 1").collect()[0]["version"] for n in manifest.tables
-        },
-    }
-    Path(catalog_dir, CATALOG_META_FILE).write_text(json.dumps(meta, indent=2))
+    check_integrity({n: spark.table(n) for n in manifest.tables}, manifest)
+    meta = CatalogMeta(
+        manifest_hash=manifest_hash(manifest_path),
+        seed=seed,
+        scale=scale,
+        table_versions={n: spark.sql(f"DESCRIBE HISTORY {n} LIMIT 1").collect()[0]["version"] for n in manifest.tables},
+    )
+    Path(catalog_dir, CATALOG_META_FILE).write_text(meta.model_dump_json(indent=2))
     spark.stop()
 
 

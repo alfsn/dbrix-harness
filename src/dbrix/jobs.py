@@ -1,13 +1,23 @@
 """One-off jobs containers for trusted dbrix code (§7)."""
 
 import sys
+from pathlib import Path
 from typing import Any
 
 import docker
 
+from dbrix.config import JOB_ERROR_LINES
+
 
 class JobError(Exception):
     pass
+
+
+def require_empty_dir(path: Path, why: str) -> None:
+    """Create `path` if needed. Raises FileExistsError when it holds anything."""
+    path.mkdir(parents=True, exist_ok=True)
+    if any(path.iterdir()):
+        raise FileExistsError(f"{path} is not empty; {why}")
 
 
 def run_job(
@@ -32,7 +42,8 @@ def run_job(
             sys.stderr.buffer.write(chunk)
         status = container.wait()["StatusCode"]
         if status:
-            raise JobError(f"job {command} exited with status {status}")
+            tail = container.logs(stdout=False, stderr=True, tail=JOB_ERROR_LINES).decode(errors="replace")
+            raise JobError(f"job {command} exited with status {status}:\n{tail}")
         return str(container.logs(stdout=True, stderr=False).decode())
     finally:
         container.remove(force=True)

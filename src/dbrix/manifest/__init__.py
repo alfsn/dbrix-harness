@@ -13,6 +13,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from sqlglot import exp
 
+from dbrix.config import CATALOG_META_FILE
+
 
 class ManifestError(ValueError):
     pass
@@ -134,6 +136,26 @@ def manifest_hash(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class CatalogMeta(_Model):
+    """`_catalog_meta.json`: binds a prod catalog to the manifest it was generated from (§3.3)."""
+
+    manifest_hash: str
+    seed: int
+    scale: float
+    table_versions: dict[str, int]
+
+
+def read_catalog_meta(catalog_dir: Path, manifest_path: Path) -> CatalogMeta:
+    """Raises ManifestError when the catalog has no meta or was generated from another manifest."""
+    path = catalog_dir / CATALOG_META_FILE
+    if not path.exists():
+        raise ManifestError(f"{path} not found; generate the prod catalog first (python -m dbrix.generator)")
+    meta = CatalogMeta.model_validate_json(path.read_text())
+    if meta.manifest_hash != manifest_hash(manifest_path):
+        raise ManifestError(f"{catalog_dir} was generated from another manifest than {manifest_path}; regenerate it")
+    return meta
+
+
 def validate(m: Manifest) -> list[str]:
     """Every problem found in the manifest, as messages. Empty when it is valid."""
     errors: list[str] = []
@@ -148,17 +170,23 @@ def validate(m: Manifest) -> list[str]:
         else:
             errors += _validate_generated(m, name, t)
 
-    anchor = m.tables.get(m.default_anchor.table)
-    if anchor is None or anchor.layer == "gold":
-        errors.append(f"default_anchor: '{m.default_anchor.table}' is not a non-Gold table")
-    elif m.default_anchor.key not in anchor.primary_key:
-        errors.append(f"default_anchor: '{m.default_anchor.key}' is not a PK column of {m.default_anchor.table}")
+    errors += [f"default_anchor: {e}" for e in validate_anchor(m, m.default_anchor)]
 
     try:
         m.generation_order()
     except graphlib.CycleError as e:
         errors.append(f"FK graph has a cycle: {' -> '.join(e.args[1])}")
     return errors
+
+
+def validate_anchor(m: Manifest, anchor: Anchor) -> list[str]:
+    """Problems with `anchor` as the sampling anchor (§4.1). Empty when it is valid."""
+    t = m.tables.get(anchor.table)
+    if t is None or t.layer == "gold":
+        return [f"'{anchor.table}' is not a non-Gold table"]
+    if anchor.key not in t.primary_key:
+        return [f"'{anchor.key}' is not a PK column of {anchor.table}"]
+    return []
 
 
 def _validate_gold(m: Manifest, name: str, t: Table) -> list[str]:

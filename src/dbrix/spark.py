@@ -1,10 +1,14 @@
-"""The SparkSession used in dbrix-spark containers: Delta plus a Derby metastore in the catalog dir."""
+"""Spark in dbrix-spark containers: the session (Delta plus a Derby metastore in the catalog dir) and the
+catalog steps shared by the generator and the sampler."""
 
 from glob import glob
 
-from pyspark.sql import SparkSession
+from pyspark.sql import Column, SparkSession
+from pyspark.sql import functions as F
 
 from dbrix.config import DELTA_JARS, METASTORE_DIR, SPARK_DRIVER_MEMORY, SPARK_SHUFFLE_PARTITIONS
+from dbrix.manifest import Manifest
+from dbrix.rewrite import to_sandbox_sql
 
 
 def create_session(catalog_dir: str) -> SparkSession:
@@ -30,3 +34,27 @@ def create_session(catalog_dir: str) -> SparkSession:
     )
     spark.sparkContext.setLogLevel("WARN")
     return spark
+
+
+def unit(h: Column) -> Column:
+    """A 64-bit hash mapped onto [0, 1)."""
+    return F.shiftrightunsigned(h, 11) / float(2**53)
+
+
+def table_path(catalog_dir: str, name: str) -> str:
+    """Where `<schema>.<table>` is stored in a catalog dir (§3.3, §4.3)."""
+    return f"{catalog_dir}/{name.replace('.', '/')}"
+
+
+def create_schemas(spark: SparkSession, manifest: Manifest, catalog_dir: str) -> None:
+    """One database per manifest schema, stored at `<catalog_dir>/<schema>` (§3.3, §4.3)."""
+    for schema in sorted({name.split(".")[0] for name in manifest.tables}):
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {schema} LOCATION '{catalog_dir}/{schema}'")
+
+
+def write_gold(spark: SparkSession, manifest: Manifest) -> None:
+    """Run each Gold transform over the Bronze and Silver tables in the metastore and save the result."""
+    for name, t in manifest.tables.items():
+        if t.transform:
+            spark.sql(to_sandbox_sql(t.transform, manifest.catalog)).write.format("delta").saveAsTable(name)
+            print(f"computed {name}", flush=True)

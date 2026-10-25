@@ -6,7 +6,7 @@ from typing import Any
 import docker
 
 from dbrix.config import MANIFEST_MOUNT, PROD_CATALOG_MOUNT
-from dbrix.jobs import run_job
+from dbrix.jobs import require_empty_dir, run_job
 from dbrix.manifest import load_manifest
 
 
@@ -20,11 +20,7 @@ def run_generator(
     **docker_kwargs: Any,
 ) -> None:
     load_manifest(manifest)  # fail fast, before starting Spark
-    prod_catalog_dir.mkdir(parents=True, exist_ok=True)
-    if any(prod_catalog_dir.iterdir()):
-        raise FileExistsError(
-            f"{prod_catalog_dir} is not empty; the prod catalog is immutable, delete it to regenerate"
-        )
+    require_empty_dir(prod_catalog_dir, "the prod catalog is immutable, delete it to regenerate")
     run_job(
         client,
         image,
