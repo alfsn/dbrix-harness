@@ -102,7 +102,7 @@ dbrix-harness/
 │   ├── manifest/      # pydantic models, loader, validation
 │   ├── generator/     # Phase 1 (runs in jobs container)
 │   ├── sampler/       # Phase 2 (runs in jobs container)
-│   ├── policy/        # Phase 3: sql.py, python.py, report.py, exceptions.py
+│   ├── policy/        # Phase 3: sql.py, python.py, report.py, exceptions.py, spark_functions.txt
 │   ├── rewrite/       # Phase 4: name rewrite + reverse mapping (used in containers)
 │   ├── executor/      # client.py (host), runtime/ (in container)
 │   ├── lifecycle/     # Phase 5: manager.py, meta.py, runlog.py, gc.py, locks.py
@@ -329,6 +329,13 @@ Not an option: sampling inside the executor container to save one JVM start. The
 def check(code: str, language: Literal["sql", "pyspark"]) -> PolicyReport:
     """Mode-free. Raises SandboxSecurityException for code blocked in every mode."""
 
+TableRef = str                    # dotted name, lowercase, unquoted: "prod_catalog.silver.posts"
+
+class Location(BaseModel):
+    statement: int | None         # SQL: index of the statement, from 0
+    line: int | None              # Python line/col; for SQL inside spark.sql, the call's position
+    col: int | None
+
 class PolicyReport(BaseModel):
     reads: set[TableRef]          # tables read, when statically known
     writes: list[WriteOp]         # every write found, in every mode
@@ -336,7 +343,7 @@ class PolicyReport(BaseModel):
 
 class WriteOp(BaseModel):
     kind: Literal["INSERT", "UPDATE", "DELETE", "MERGE", "CREATE_TABLE", "CREATE_VIEW",
-                  "ALTER_TABLE", "DROP_TABLE", "TRUNCATE", "SAVE_AS_TABLE", "WRITE_TO"]
+                  "ALTER_TABLE", "DROP_TABLE", "DROP_VIEW", "TRUNCATE", "SAVE_AS_TABLE", "WRITE_TO"]
     target: TableRef | None       # None when the name is built at runtime
     location: Location
 
@@ -355,6 +362,8 @@ class SandboxSecurityException(Exception):
 
 `insertInto` is reported as `INSERT`, so `INSERT` covers both the SQL statement and the DataFrame call.
 
+`check` raises on the first blocked construct. `WriteOp.kind` is an internal label for code and `runs.jsonl`; people and the agent see the statement itself (§8.3).
+
 ### 5.2 One policy, two call sites
 
 The same `check` function runs in two places. Neither place repeats the other's work:
@@ -366,7 +375,7 @@ The same `check` function runs in two places. Neither place repeats the other's 
 
 **Table names are checked only at runtime**, because only the container knows which tables and temp views exist right now (including tables the agent created and temp views from earlier calls). The host does not check table names.
 
-Statement kinds and Python imports are short **allowlists** (unknown is blocked). SQL functions use a short **blocklist**. Code that fails to parse is blocked. The red-team suite (§11.3) proves the container contains whatever the policy misses.
+Statement kinds, Python imports, and the modules an attribute chain may pass through are short **allowlists** (unknown is blocked). SQL functions use an **audited blocklist**: every function of the pinned Spark version was reviewed once, and a Docker test fails when the image's `SHOW FUNCTIONS` output changes, so an upgrade forces a new review. Code that fails to parse is blocked. The red-team suite (§11.3) proves the container contains whatever the policy misses.
 
 ### 5.3 SQL policy (sqlglot, dialect `spark`)
 
@@ -374,17 +383,24 @@ This applies to `run_sql` and to every SQL string passed to `spark.sql` in PySpa
 
 | Statement | Result |
 |---|---|
-| `SELECT`, `WITH … SELECT`, `EXPLAIN`, `DESCRIBE`, `SHOW TABLES/SCHEMAS/COLUMNS/CATALOGS` | read |
-| `CREATE TEMP VIEW` | read (session-local) |
+| `SELECT` (and `UNION`/`INTERSECT`/`EXCEPT`), `WITH … SELECT`, `DESCRIBE` (incl. `DETAIL`, `HISTORY`, `EXTENDED`), `SHOW TABLES/SCHEMAS/DATABASES/COLUMNS/CATALOGS` | read |
+| `EXPLAIN <stmt>` | same as `<stmt>` (a write inside still counts as a write, though EXPLAIN never runs it) |
+| `CREATE TEMP VIEW`, `DROP VIEW <1-part name>` | read (session-local temp view) |
 | `INSERT`, `UPDATE`, `DELETE`, `MERGE` | write |
-| `CREATE TABLE [AS]`, `CREATE VIEW`, `ALTER TABLE`, `DROP TABLE`, `TRUNCATE` | write |
-| `CREATE/DROP CATALOG/SCHEMA/DATABASE`, `USE` | blocked |
-| `SET`, `RESET`, `ADD JAR/FILE`, `CREATE FUNCTION`, `REFRESH`, `CACHE`/`UNCACHE`, `MSCK`, `VACUUM`, `OPTIMIZE` | blocked |
+| `CREATE TABLE [AS]`, `CREATE VIEW`, `ALTER TABLE`, `DROP TABLE`, `DROP VIEW <3-part name>`, `TRUNCATE` | write |
+| `CREATE/DROP CATALOG/SCHEMA/DATABASE`, `USE`, `CREATE GLOBAL TEMP VIEW` | blocked |
+| `SET`, `RESET`, `ADD JAR/FILE`, `CREATE FUNCTION`, `REFRESH`, `CACHE`/`UNCACHE`, `MSCK`, `VACUUM`, `OPTIMIZE`, `EXECUTE IMMEDIATE`, `BEGIN … END` scripts | blocked |
 | anything else | blocked |
 
+sqlglot keeps `SHOW` and `EXPLAIN` as unparsed text and fails on `DESCRIBE DETAIL`; `policy/sql.py` parses the table name or inner statement of these itself, so the rules below apply to them too.
+
 Additional rules:
-- **No path-based sources:** ``delta.`/path` ``, ``parquet.`/path` ``, `read_files(...)`, `LOCATION '…'`, and other string-literal table sources are blocked.
-- **Function blocklist** (data in `policy/sql.py`): `reflect`, `java_method`, `input_file_name`, `input_file_block_start`, `input_file_block_length`. The hidden `_metadata` column is also blocked. The last four would leak sandbox paths (§6.5).
+- **No path-based sources:** ``delta.`/path` ``, ``parquet.`/path` `` (any table name part containing `/`), table-valued functions with a string-literal argument (`read_files('/p')`; `range(10)` is fine), `LOCATION '…'`, `INSERT OVERWRITE DIRECTORY`, and `OPTIONS (path …)` are blocked.
+- **Function blocklist** (audited against Spark 4.2.0's 577 functions, data in `policy/sql.py`):
+  - call Java: `reflect`, `java_method`, `try_reflect`;
+  - read a path: `table_changes_by_path`, `from_protobuf`, `to_protobuf` (descriptor file);
+  - leak sandbox paths or names (§6.5): `input_file_name`, `input_file_block_start`, `input_file_block_length`, `current_path` (returns `spark_catalog.default`).
+  - Any identifier `_metadata` is also blocked. `python_worker_logs` needs a `SET` to work, which is blocked.
 - **Table names:** checked at runtime (§6.1).
 
 ### 5.4 PySpark policy (Python `ast`)
@@ -394,12 +410,18 @@ Additional rules:
 | Imports allowed only from: `pyspark.sql`, `pyspark.sql.functions`, `pyspark.sql.types`, `pyspark.sql.window`, `math`, `datetime`, `decimal`, `json`, `re`, `collections`, `itertools`, `functools`, `statistics`, `typing` | others blocked |
 | Builtins `exec`, `eval`, `compile`, `__import__`, `open`, `getattr`, `setattr`, `delattr`, `globals`, `locals`, `vars`, `input`, `breakpoint`, `memoryview`, `exit`, `quit`, `help` | blocked |
 | Underscore names and attributes (see below) | blocked |
-| `spark.sparkContext`, `.rdd.pipe`, `addFile`, `addPyFile`, `spark.conf.set`, `spark.udf.registerJavaFunction`, `spark.newSession`, `SparkSession.builder` | blocked |
-| Path-based reads: `spark.read.load/parquet/csv/json/text/orc`, `.format(...).load(...)` | blocked (hint: use `spark.table`) |
+| Module attributes: a chain that starts at a module (`T.os`, `F.sys`, `typing.sys`, `pyspark.SparkContext` after `import pyspark.sql`) may only pass through allowed modules. A module name may only be used as `name.attr` (no `m = T`) | others blocked |
+| Attributes `sparkContext`, `rdd`, `catalog`, `pipe`, `addFile`, `addPyFile`, `registerJavaFunction`, `newSession`, `builder`, `dataSource`, `addArtifact`, `addArtifacts`, `copyFromLocalToFs`, `inputFiles`, and `conf.set` | blocked (hints: SQL `SHOW TABLES`/`DESCRIBE` for `catalog`, DataFrame methods for `rdd`) |
+| Python names of blocked SQL functions (`F.reflect`, `F.input_file_name`, …, the §5.3 list) and `F.call_function` | blocked |
+| String literals `"_metadata"` or `"_metadata.…"` | blocked |
+| SQL expression strings: a string literal passed to `F.expr`, `selectExpr`, `filter`, or `where` | checked with the §5.3 function and `_metadata` rules |
+| Path-based reads: `spark.read.load/parquet/csv/json/text/orc`, `.format(...).load(...)`, `readStream` | blocked (hint: use `spark.table`) |
 | `spark.table("…")`, `spark.read.table("…")`, `spark.sql("…")` | read |
 | `.write…saveAsTable`, `.write…insertInto`, `.writeTo(…)` | write (table-name targets only) |
-| Path-based writes (`.save(path)`, `.parquet(path)`, …), `.writeStream` | blocked |
+| Path-based writes (`.save(path)`, `.parquet(path)`, …), a writer `path` option (`.option("path", …)`, `.options(path=…)`), `.writeStream` | blocked |
 | Python UDFs (`F.udf`, `pandas_udf`) | allowed; their bodies are part of the code, so the same rules apply |
+
+The runtime wrapper also wraps `F.expr`, `selectExpr`, `filter`, and `where`, so SQL expression strings built at runtime are checked too (§6.1).
 
 **Underscore rules.** Private attributes are the way from PySpark into the JVM (`spark._jvm`, `spark._jsparkSession`, `df._jdf`, `sc._jsc`) and into Python internals (`x.__class__.__bases__`). Plain local names are not. So:
 
@@ -420,7 +442,7 @@ The hint for a blocked `row._1` is `row["_1"]`.
 
 ### 5.5 Known limits (documented, accepted)
 
-A static check of Python can't be complete. The red-team suite (§11.3) tracks known bypass classes. Anything that gets past §5 is still confined by §7: no prod data, no network, nothing on disk outside its own `/sandbox`, and resource limits.
+A static check of Python can't be complete. The red-team suite (§11.3) tracks known bypass classes, among them aliases that hide a call chain (`r = spark.read; r.parquet(p)`) and `str.format` reading private attributes (`"{0.__class__}".format(x)`; it can read but not call). Anything that gets past §5 is still confined by §7: no prod data, no network, nothing on disk outside its own `/sandbox`, and resource limits.
 
 ---
 
@@ -432,7 +454,7 @@ A static check of Python can't be complete. The red-team suite (§11.3) tracks k
 
 All rewriting happens **inside the container, at runtime**. The host never rewrites code. There is no static PySpark rewriter.
 
-The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `DataFrameWriter.saveAsTable`, `DataFrameWriter.insertInto`, and `DataFrame.writeTo` before agent code runs. `run_sql` runs each statement through the wrapped `spark.sql`, so both tools take the same path. Gold `transform`s in the jobs container use the same rewriter.
+The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `DataFrameWriter.saveAsTable`, `DataFrameWriter.insertInto`, `DataFrame.writeTo`, and the SQL-expression entry points `F.expr`, `DataFrame.selectExpr`, `DataFrame.filter`, and `DataFrame.where` (string arguments only; these get the §5.3 function and `_metadata` rules) before agent code runs. `run_sql` runs each statement through the wrapped `spark.sql`, so both tools take the same path. Gold `transform`s in the jobs container use the same rewriter.
 
 For each SQL string (parsed with sqlglot) or table name, the wrapper:
 1. runs `policy.check` on it (§5.2), and blocks writes if `allow_writes` is false;
@@ -520,7 +542,9 @@ The agent should never see that it is not on Databricks `prod_catalog`. The plac
 
 Reverse mapping is **not** applied to the data rows of normal queries (a `SELECT` over user data), so real data is never changed.
 
-**Known leaks (accepted):** the Spark version, the exact text of some Spark error messages, and the `default` schema in `SHOW SCHEMAS`.
+**Known leaks (accepted):** the Spark version, the exact text of some Spark error messages, the `default` schema in `SHOW SCHEMAS` and `current_database()`, and the container user `dbrix` in `current_user()`.
+
+The class name `SandboxSecurityException` is not shown to the agent: `AgentError.type` for policy errors is `SecurityException`.
 
 ---
 
@@ -578,7 +602,7 @@ DbrixSandboxMiddleware(
 
 `interrupt_on` in Deep Agents is configured **per tool name**, but we need approval **only when the code writes**. The middleware therefore raises the LangGraph `interrupt()` itself, using the **same request and decision shape as Deep Agents' HITL middleware**, so any client that handles `interrupt_on` handles ours with no changes.
 
-- **Interrupt payload:** tool name, the code, the `WriteOp` list (kind, target table in prod names or "unknown", location), the dynamic-SQL warning if relevant, and the sandbox id.
+- **Interrupt payload:** tool name, the code, the `WriteOp` list (kind, target table in prod names or "unknown", location), the dynamic-SQL warning if relevant, and the sandbox id. The person approving is shown each write as the agent's own statement (e.g. `DROP VIEW prod_catalog.gold.v`), not the internal `kind` label.
 - **Decisions:**
   - `approve` runs the code as is, with `allow_writes=true`.
   - `edit` runs the human-edited code, which **goes through the policy again** and asks again if it still writes.
@@ -761,6 +785,7 @@ ttl_seconds = 86400
 - Sampler: no dangling FKs and no duplicate PKs for 5 random seeds. The up pass never adds children to tables reached by the down pass. Organic posts and their metrics appear. `raw_creator_profiles` contains only profiles of creators already in the sandbox. Gold equals the transform rerun over the sampled Silver. The same IDs give the same sandbox.
 - IDs: `_`, `.`, `/`, and over-long IDs are rejected.
 - Policy: table-driven cases for every row of §5.3 and §5.4, including each underscore case. `PolicyReport.writes` is correct. `check` gives the same result regardless of mode (it has no mode).
+- Policy (Docker, slow): the image's `SHOW FUNCTIONS` output equals the audited list in `policy/spark_functions.txt`; a change means a new review (§5.2).
 - Rewriter: every row of the §6.1 table. 3-part names round-trip. Reverse mapping removes every sandbox name and path from errors, stdout, and metadata output (§6.5), and leaves normal data rows unchanged.
 - Run log: a repeated `run_id` is written once.
 - GC: fake-clock tests for TTL, `active_run` skip, stale `active_run`, corrupt meta, and leftover `.creating-*` dirs.
@@ -781,7 +806,7 @@ ttl_seconds = 86400
 - The same middleware works with plain `create_agent`.
 
 ### 11.3 Red team (must all fail to touch prod or escape)
-`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
+`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
 
 For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own.
 
@@ -867,3 +892,10 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 33 | Nullable FKs | — | Read from the data (any null rows), not from the manifest. An FK with no nulls adds no null-FK sample |
 | 34 | Up pass | repeat until nothing changes | One children-first walk; same result on a DAG |
 | 35 | Sampler scope | — | Builds into an empty dir and returns the `sampling` block and row counts. Lock, `.creating` dir, rename, and meta file are the lifecycle layer's job |
+| 36 | SQL function list | short blocklist | **Audited blocklist**: all 577 functions of Spark 4.2.0 reviewed once; a Docker test fails when `SHOW FUNCTIONS` changes. Adds `try_reflect`, `table_changes_by_path`, `from_protobuf`/`to_protobuf`, `current_path` |
+| 37 | Module attributes | — | Allowed modules expose others (`T.os`, `F.sys`, `typing.sys`). An attribute chain from a module may only pass through allowed modules; a module name is used only as `name.attr` |
+| 38 | Spark 4 Python API | — | Block `F.reflect`/`java_method`/`try_reflect`/`call_function`, `spark.catalog`, `df.rdd`, `dataSource`, `addArtifact(s)`, `copyFromLocalToFs`, `inputFiles`, `readStream`, and a writer `path` option |
+| 39 | SQL expression strings | — | `F.expr`, `selectExpr`, `filter`, `where` strings get the function and `_metadata` rules: literals statically, all strings in the runtime wrapper |
+| 40 | `EXPLAIN` | read | `EXPLAIN X` is treated like X (a write inside needs approval though nothing runs). Less code; errs safe |
+| 41 | `DROP VIEW` | — | 3-part name: write `DROP_VIEW`; 1-part (temp view): read. Approval shows the statement, not the label |
+| 42 | `TableRef` | — | Lowercase, unquoted dotted name (Spark names ignore case) |
