@@ -236,19 +236,26 @@ Write `S[T]` for the set of selected rows of table `T`.
 
 1. **Seed:** sample `sample_size` distinct `anchor_key` values from `anchor_table` → `S[anchor]`.
 2. **Down pass (children):** walk tables in topological order. For each table `C` with an FK to a parent `P` that the down pass already reached, add to `S[C]` the rows whose FK value is in `S[P]`. If several down-pass parents reach `C`, take the **union**.
-3. **Null-FK rows:** when the down pass reaches `C` through a **nullable** FK, also add a random sample (at `unrelated_sample_fraction`) of the rows of `C` where that FK is null. These rows are part of the down pass, so their own children follow in later steps of step 2.
+3. **Null-FK rows:** for each FK through which the down pass reaches `C`, also add a random sample (at `unrelated_sample_fraction`) of the rows of `C` where that FK is null. A composite FK counts as null when any of its columns is null. Whether an FK has nulls is read from the data, not the manifest: an FK with no null rows simply adds nothing. These rows are part of the down pass, so their own children follow in later steps of step 2.
    *Example:* organic posts (`posts.campaign_id IS NULL`) are sampled here, and their `post_metrics_daily` and Bronze events follow them down.
-4. **Up pass (parents only):** repeat until nothing changes. For each selected row and each of its non-null FKs, add the referenced parent row if it is missing. **Never** expand downward from a row the up pass added into a table that steps 2–3 already reached.
+4. **Up pass (parents only):** for each selected row and each of its non-null FKs, add the referenced parent row if it is missing. **Never** expand downward from a row the up pass added into a table that steps 2–3 already reached. Done as one walk over the tables, children first (reverse topological order), checking each table's selected rows when the walk reaches it. Because the FK graph is a DAG, a parent added here can only point at tables later in the walk, so one walk gives the same result as repeating until nothing changes.
    *Example:* brand → campaigns → posts → (up) social_accounts → (up) creators. Those creators do **not** bring in their posts for other brands.
-5. **Fill unreached tables:** walk the tables that steps 2–4 did not reach, in topological order. For each, select the rows whose FK values point at rows that are **already selected** in the parent (semi-join). No up pass is needed, because those parents are already present.
-   *Example:* `raw_creator_profiles` is not reached by the down pass, because its parent `creators` only enters through the up pass. Step 5 adds the profiles of the creators already in the sandbox, instead of a random 5% of all profiles (which would pull in about 2,000 unrelated creators).
-6. **Islands:** a non-Gold table that has no selected parent at all after step 5 (or no FK at all and not reached) gets a random sample at `unrelated_sample_fraction`, followed by an up pass for those rows. The default domain has no such tables.
-7. **Gold:** do not copy. Rerun each Gold `transform` (through the rewriter) over the sampled Silver tables, so Gold always matches the sandbox.
-8. **Validate:** every non-null FK resolves and there are no duplicate PKs (shared function, §3.3). On failure, creation fails (§9.5).
+5. **Fill and islands:** walk the non-Gold tables that steps 2–4 did not reach, in topological order (parents first). For each table:
+   - **Fill**, if any of its parents has selected rows: select the rows where **every non-null FK** points at a row that is already selected, and at least one FK is non-null (semi-joins). No up pass is needed, because those parents are already present. A row with an FK pointing outside the sandbox is left out, rather than pulling in an unrelated parent.
+   - **Island**, otherwise (no FK, or no parent with selected rows): a random sample at `unrelated_sample_fraction`, followed by an up pass.
+
+   Because the walk goes parents first, an island's children are filled from the island's rows ("sample the parent, then take its children"), not sampled separately.
+   *Example (fill):* `raw_creator_profiles` is not reached by the down pass, because its parent `creators` only enters through the up pass. Step 5 adds the profiles of the creators already in the sandbox, instead of a random 5% of all profiles (which would pull in about 2,000 unrelated creators).
+   *Example (island):* a table `agencies` with no FK, and `agency_staff` with an FK to it, neither reachable from brands. `agencies` gets a 5% sample, then `agency_staff` gets all staff of those agencies. The default domain has no such tables.
+   *Example (several FKs):* `account_follows(follower_id, followed_id)`, both FKs to `social_accounts`. With accounts X and Y in the sandbox, `X→Y` is kept and `X→Z` is left out, so Z is not pulled in.
+6. **Gold:** do not copy. Rerun each Gold `transform` (through the rewriter) over the sampled Silver tables, so Gold always matches the sandbox.
+7. **Validate:** every non-null FK resolves and there are no duplicate PKs (shared function, §3.3). On failure, creation fails (§9.5).
 
 Nullable FKs with a null value are ignored by the up pass.
 
-The algorithm is implemented as Spark semi-joins over Delta tables. Sets are never collected to the driver. Prod tables are read by path (`delta.`/prod_catalog/<schema>/<table>``); this is trusted code, so the policy does not apply.
+The algorithm is implemented as Spark semi-joins over Delta tables. Sets are never collected to the driver. Every random choice (the anchor keys, null-FK rows, islands) is a hash of `(seed, table, primary key)`, never `rand()` or `DataFrame.sample()`, so the result does not depend on partitioning (same rule as §3.3). Prod tables are read by path (`delta.`/prod_catalog/<schema>/<table>``); this is trusted code, so the policy does not apply.
+
+**Scope of the sampler:** it builds into an empty directory it is given and returns the `sampling` block and `row_counts` of `_sandbox_meta.json` (§9.1). The lock, the `.creating-<id>` directory, the rename, and writing the meta file belong to the lifecycle layer (§9.5).
 
 **Known limitation (accepted):** rows added by the up pass are **incomplete**: a creator added because one of their posts was selected only has the social accounts and posts that are linked to the sampled brands. Queries such as "accounts per creator" or "posts per creator across all brands" give smaller numbers in the sandbox than in prod. The agent-facing docs (`/catalog/README.md`) state this.
 
@@ -278,6 +285,36 @@ The logical namespace is `sandbox_catalog.agent_{agent_id}_{session_id}`, used i
 - The sandbox id is `agent_{agent_id}_{session_id}`. Because neither ID can contain `_`, the id always splits back into exactly one `(agent_id, session_id)` pair. Two different pairs can never produce the same id (for example, `a_b` + `c` and `a` + `b_c` are both rejected).
 - No `.` or `/` means no path injection (`../`).
 - `session_id` is the LangGraph `thread_id` (§8.2). UUIDs pass. A `thread_id` that doesn't match is a host configuration error: the middleware raises `InvalidSandboxIdError` into the graph (it is not the agent's fault, so it is not sent back as feedback).
+
+### 4.5 Speed (measured, to optimize later)
+
+**Measured** (2026-10-25, scale 1, Docker Desktop with 8 CPUs and 8 GB): one sandbox takes **about 120 s**. The §11.4 target (under 30 s, including the executor start) is **not met yet**.
+
+| Step | Time | Note |
+|---|---|---|
+| Start Spark | 6 s | |
+| Select rows (§4.2 steps 1–5) | 48 s | About 20 checkpointed queries, 1–5 s each; the first is about 10 s (JVM warm-up) |
+| Create schemas | 5 s | First use of the Derby metastore |
+| Write 10 tables | 9 s | About 1 s each |
+| Gold | 18 s | 3 transforms |
+| Integrity check (read back) | 30 s | About 25 count queries |
+| Row counts | 4 s | |
+
+**The cause is not the data** (at most about 100k rows per table). Each query spends 3–5 s in **planning** and about 1 s running. The first time a query touches a Delta table, Delta reconstructs its snapshot from `_delta_log` with extra Spark jobs. The first job of each kind also pays JVM warm-up. File access through the bind mount is not a factor: reads inside the container's own filesystem are no faster.
+
+**Tried, no gain (reverted):** running the integrity check as one Spark job (30 s → 29 s), and lazy `cache()` instead of eager `localCheckpoint()` (no change).
+
+**Proposals, in the order to try them.** Measure each one on its own and keep only what helps:
+
+1. **Delta settings for small tables.** `spark.databricks.delta.snapshotPartitions` defaults to 50, so every snapshot rebuild runs 50 tasks. Set it to 1–2. Also try `spark.sql.shuffle.partitions` at 1–2 and turning off Delta's statistics collection on write. These are config-only changes in `dbrix/spark.py`, and they help the generator and the executor too.
+2. **Check integrity before writing.** Run the check on the selected DataFrames, which are already in memory, instead of reading the tables back from Delta. Gold can likewise be computed from temp views over the selected DataFrames, then written. This avoids a second Delta snapshot per table.
+3. **Fewer prod table touches.** Read each prod table once and reuse the DataFrame. Avoid scanning a large table twice in the down pass (semi-join plus the null-FK sample).
+4. **Overlap startup with sampling.** Start the executor container's JVM while the sampler runs, and open the metastore only after the sampler finishes (§9.5). This hides about 6 s.
+5. **Move table registration to the executor.** The sampler writes Delta by path with no metastore, and the executor registers the manifest's tables once (`CREATE TABLE … USING DELTA LOCATION`) when it first starts. The executor initializes the metastore anyway, so the sampler's metastore start (about 5–10 s) goes away. This changes §4.3 and §6.3.
+6. **Read prod as Parquet, not Delta.** Prod is written once and never changed, so its Parquet files are its content. This skips snapshot reconstruction on prod, but breaks "one engine, real Delta" and would silently break if prod is ever updated. Last resort.
+7. **Start sampling earlier.** Start building the sandbox when the agent is built, or when a thread starts, instead of on the first tool call. This hides the wait instead of shortening it.
+
+Not an option: sampling inside the executor container to save one JVM start. The executor must never see `prod_catalog` (§7).
 
 ---
 
@@ -715,12 +752,12 @@ ttl_seconds = 86400
 
 ## 11. Quality, testing & acceptance criteria
 
-**Tooling:** uv, Python 3.12, pytest, ruff, mypy (strict on `src/`). Integration and red-team tests need Docker and run locally (`pytest -m docker`). Agent-level tests use a scripted fake chat model, so no API key is needed.
+**Tooling:** uv, Python 3.12, pytest, ruff, mypy (strict on `src/`). Integration and red-team tests need Docker and run locally: `pytest -m "docker and not slow" --basetemp=.pytest_docker_tmp`. The two scale-1 speed tests (generator, sampler) are marked `slow` and run on demand with `-m slow`, because each needs a scale-1 catalog and takes minutes. Docker runs use their own `--basetemp`, because pytest empties its basetemp at every start and a unit run started meanwhile would delete the Docker run's catalogs. Every Spark container costs 1–2 min (§4.5), so tests keep containers few: properties that only need the selected rows (determinism, the 5 seeds) run in memory in one container, and only one test builds a real sandbox. Agent-level tests use a scripted fake chat model, so no API key is needed.
 
 ### 11.1 Unit
 - Manifest validation catches every error class in §3.1, including self-references and composite FK mismatches.
 - The generator is deterministic: same seed gives an identical content hash per table.
-- Sampler: no dangling FKs and no duplicate PKs for 20 random seeds. The up pass never adds children to tables reached by the down pass. Organic posts and their metrics appear. `raw_creator_profiles` contains only profiles of creators already in the sandbox. Gold equals the transform rerun over the sampled Silver. The same IDs give the same sandbox.
+- Sampler: no dangling FKs and no duplicate PKs for 5 random seeds. The up pass never adds children to tables reached by the down pass. Organic posts and their metrics appear. `raw_creator_profiles` contains only profiles of creators already in the sandbox. Gold equals the transform rerun over the sampled Silver. The same IDs give the same sandbox.
 - IDs: `_`, `.`, `/`, and over-long IDs are rejected.
 - Policy: table-driven cases for every row of §5.3 and §5.4, including each underscore case. `PolicyReport.writes` is correct. `check` gives the same result regardless of mode (it has no mode).
 - Rewriter: every row of the §6.1 table. 3-part names round-trip. Reverse mapping removes every sandbox name and path from errors, stdout, and metadata output (§6.5), and leaves normal data rows unchanged.
@@ -749,7 +786,7 @@ For each case: the policy should block it (this is the feedback layer). Separate
 
 ### 11.4 Acceptance (v0 is done when)
 1. `python -m dbrix.generator` at scale 1 finishes in under 2 min and passes integrity checks.
-2. Sandbox creation with defaults finishes in under 30 s, including first Spark start, and passes FK validation.
+2. Sandbox creation with defaults finishes in under 30 s, including first Spark start, and passes FK validation. *Not met yet: about 120 s measured; see §4.5.*
 3. A Deep Agent built with `create_sandboxed_deep_agent` and a real Claude model answers "Which creator had the best engagement rate for brand X last month?" using an unchanged `run_sql` tool.
 4. In READ_WRITE, an agent's `CREATE TABLE prod_catalog.gold.my_summary AS …` pauses for approval. After approval the table exists only in that sandbox, and the agent can query it in its next call.
 5. Every red-team case is blocked by the policy **and** contained when the policy is disabled.
@@ -825,3 +862,7 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 29 | Approval resume | — | Nothing is written before `interrupt()`; `run_id = tool_call_id`; the run log skips duplicates |
 | 30 | Concurrency | — | Runs serialized per sandbox; async waits in a worker thread; the timeout counts only running time |
 | 31 | Container limit | — | At most 2 executors. Evict the least recently used idle one; if all are busy, wait up to `run_timeout`, then return "executor busy" |
+| 32 | Sampler fill and islands | separate steps | One parent-first walk: an island is sampled, then its children are filled from it. A filled row needs every non-null FK to point at a selected row, so no unrelated parents are pulled in |
+| 33 | Nullable FKs | — | Read from the data (any null rows), not from the manifest. An FK with no nulls adds no null-FK sample |
+| 34 | Up pass | repeat until nothing changes | One children-first walk; same result on a DAG |
+| 35 | Sampler scope | — | Builds into an empty dir and returns the `sampling` block and row counts. Lock, `.creating` dir, rename, and meta file are the lifecycle layer's job |
