@@ -18,6 +18,8 @@ BLOCKED: list[tuple[Language, str]] = [
     ("pyspark", 'df.select(F.call_function("reflect", F.lit("java.lang.Runtime"), F.lit("getRuntime")))'),
     ("pyspark", "df.select(F.expr(\"reflect('java.lang.Runtime', 'getRuntime')\"))"),
     ("pyspark", 'df.write.option("path", "/prod_catalog/silver/posts").saveAsTable("prod_catalog.gold.t")'),
+    ("pyspark", 'df.write.saveAsTable("prod_catalog.gold.t", path="/prod_catalog/silver/posts")'),
+    ("pyspark", 'df.write.options(**{"path": "/prod_catalog/silver/posts"}).saveAsTable("prod_catalog.gold.t")'),
     ("pyspark", "spark.catalog.listTables()"),
     ("pyspark", 'spark.read.parquet("/prod_catalog/silver/posts")'),
     ("pyspark", 'import socket\nsocket.create_connection(("example.com", 80))'),

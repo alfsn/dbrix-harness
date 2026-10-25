@@ -197,6 +197,12 @@ G.col("a"); H.lit(1); T.StringType(); Window.partitionBy("a")
         ("@F.udf('int')\ndef plus_one(x):\n    return x + 1", set(), [], False),
         ('df.write.saveAsTable("prod_catalog.gold.t")', set(), [("SAVE_AS_TABLE", "prod_catalog.gold.t")], False),
         (
+            'df.write.saveAsTable("prod_catalog.gold.t", mode="overwrite")',
+            set(),
+            [("SAVE_AS_TABLE", "prod_catalog.gold.t")],
+            False,
+        ),
+        (
             'df.write.mode("append").insertInto("prod_catalog.gold.t")',
             set(),
             [("INSERT", "prod_catalog.gold.t")],
@@ -318,6 +324,9 @@ def test_pyspark_allowed(code: str, reads: set[str], writes: list[tuple[str, str
         ("df.write.format('delta').save('/x')", "PY_PATH_ACCESS"),
         ("df.write.option('path', '/x').saveAsTable('prod_catalog.gold.t')", "PY_PATH_ACCESS"),
         ("df.write.options(path='/x').saveAsTable('prod_catalog.gold.t')", "PY_PATH_ACCESS"),
+        ("df.write.saveAsTable('prod_catalog.gold.t', path='/x')", "PY_PATH_ACCESS"),
+        ("df.write.options(**opts).saveAsTable('prod_catalog.gold.t')", "PY_PATH_ACCESS"),
+        ("df.write.saveAsTable('prod_catalog.gold.t', **opts)", "PY_PATH_ACCESS"),
         ("spark.table('delta.`/x`')", "SQL_PATH_SOURCE"),
         ("df.write.saveAsTable('delta.`/x`')", "SQL_PATH_SOURCE"),
         # SQL inside spark.sql

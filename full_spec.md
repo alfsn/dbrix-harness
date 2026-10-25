@@ -418,7 +418,7 @@ Additional rules:
 | Path-based reads: `spark.read.load/parquet/csv/json/text/orc`, `.format(...).load(...)`, `readStream` | blocked (hint: use `spark.table`) |
 | `spark.table("…")`, `spark.read.table("…")`, `spark.sql("…")` | read |
 | `.write…saveAsTable`, `.write…insertInto`, `.writeTo(…)` | write (table-name targets only) |
-| Path-based writes (`.save(path)`, `.parquet(path)`, …), a writer `path` option (`.option("path", …)`, `.options(path=…)`), `.writeStream` | blocked |
+| Path-based writes (`.save(path)`, `.parquet(path)`, …), a writer `path` option (`.option("path", …)`, `.options(path=…)`, `.saveAsTable(…, path=…)`), `**` unpacking in `.options(…)` or `.saveAsTable(…)` (it may hide `path`), `.writeStream` | blocked |
 | Python UDFs (`F.udf`, `pandas_udf`) | allowed; their bodies are part of the code, so the same rules apply |
 
 The runtime wrapper also wraps `F.expr`, `selectExpr`, `filter`, and `where`, so SQL expression strings built at runtime are checked too (§6.1).
@@ -476,7 +476,7 @@ The wrapper returns the list of rewritten statements, which goes into `runs.json
 
 ### 6.2 Tools and engine
 
-There is one engine, **local PySpark 3.5+ with delta-spark**, and two tools:
+There is one engine, **local PySpark 4.2 with delta-spark**, and two tools:
 
 - **`run_sql(query: str)`** runs `spark.sql(query)` for each statement. The result is the last statement's DataFrame.
 - **`run_pyspark(code: str)`** runs the code with `spark`, `F` (`pyspark.sql.functions`), and `T` (`pyspark.sql.types`) predefined. The result is the variable `result` if it is set, otherwise the value of the last expression if it is a DataFrame. Otherwise only stdout is returned.
@@ -806,7 +806,7 @@ ttl_seconds = 86400
 - The same middleware works with plain `create_agent`.
 
 ### 11.3 Red team (must all fail to touch prod or escape)
-`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
+`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `df.write.saveAsTable(…, path="/x")`, `df.write.options(**{"path": "/x"})`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
 
 For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own.
 

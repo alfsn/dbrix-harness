@@ -81,6 +81,8 @@ BLOCKED_ATTRS: dict[str, str | None] = {
 # Reader/writer methods that take a path, blocked when called on a `.read` or `.write` chain.
 PATH_METHODS = frozenset({"load", "save", "parquet", "csv", "json", "text", "orc", "xml", "jdbc"})
 WRITE_METHODS: dict[str, WriteKind] = {"saveAsTable": "SAVE_AS_TABLE", "insertInto": "INSERT", "writeTo": "WRITE_TO"}
+# Methods whose keyword arguments are options; `path=` and `**` (which may hide `path`) are blocked.
+OPTION_KEYWORD_METHODS = frozenset({"options", "saveAsTable"})
 SQL_EXPRESSION_METHODS = frozenset({"expr", "selectExpr", "filter", "where"})
 
 Violation = tuple[str, str, str | None]  # rule_id, message, hint
@@ -202,8 +204,11 @@ def _paths(node: ast.AST, _: Scope) -> Violation | None:
     method = node.func.attr
     if method in PATH_METHODS and {"read", "write"} & set(_receiver_attrs(node.func.value)):
         return "PY_PATH_ACCESS", f"path-based '.{method}()' is not allowed", PATH_HINT
+    keywords = [k.arg for k in node.keywords] if method in OPTION_KEYWORD_METHODS else []
+    if None in keywords:
+        return "PY_PATH_ACCESS", "options unpacked with ** are not allowed", "pass each option by name"
     path_option = method == "option" and (_string(_first_arg(node)) or "").lower() == "path"
-    if path_option or (method == "options" and any((k.arg or "").lower() == "path" for k in node.keywords)):
+    if path_option or any((k or "").lower() == "path" for k in keywords):
         return "PY_PATH_ACCESS", "a 'path' option is not allowed", PATH_HINT
     return None
 
