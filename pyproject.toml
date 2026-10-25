@@ -32,7 +32,13 @@ packages = ["src/dbrix"]
 testpaths = ["tests"]
 # under the repo: Docker Desktop can only bind-mount shared paths, and /tmp is not one
 addopts = "-m 'not docker' --basetemp=.pytest_tmp"
-markers = ["docker: needs Docker and the dbrix-spark image (run with -m docker)"]
+# Docker suite: -m "docker and not slow" --basetemp=.pytest_docker_tmp (about 10 min); speed tests at
+# scale 1: -m slow (about 6 min more). pytest empties its basetemp at every start, so a Docker run needs its own:
+# otherwise a unit run started meanwhile deletes the catalogs and sandboxes it is using.
+markers = [
+    "docker: needs Docker and the dbrix-spark image",
+    "slow: speed tests at scale 1; run on demand with -m slow",
+]
 
 [tool.mypy]
 strict = true

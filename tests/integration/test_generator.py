@@ -1,30 +1,16 @@
 import json
-import time
 from pathlib import Path
 
 import docker
 import pytest
 
-from dbrix.config import CATALOG_META_FILE, Config
+from dbrix.config import CATALOG_META_FILE
 from dbrix.generator import run_generator
-from dbrix.manifest import load_manifest, manifest_hash
+from dbrix.manifest import manifest_hash
 
-from .conftest import spark_json
+from .conftest import CONFIG, TABLES, content_hashes, spark_json
 
 pytestmark = pytest.mark.docker
-
-CONFIG = Config()
-TABLES = list(load_manifest(CONFIG.manifest).tables)
-
-# Order-independent content hash per table: sum of row hashes.
-CONTENT_HASHES = """
-import json
-from pyspark.sql import functions as F
-def content(root, name):
-    df = spark.read.format("delta").load(f"{root}/{name.replace('.', '/')}")
-    return str(df.select(F.sum(F.xxhash64(*df.columns).cast("decimal(38,0)"))).first()[0])
-print(json.dumps({root: {n: content(root, n) for n in %r} for root in ["/a", "/b"]}))
-"""
 
 DOMAIN_CHECKS = """
 import json
@@ -51,7 +37,7 @@ def test_generator_is_deterministic_across_core_counts(client: docker.DockerClie
     run_generator(client, CONFIG.executor.image, a, CONFIG.manifest, seed=7, scale=0.05, cpuset_cpus="0")
     run_generator(client, CONFIG.executor.image, b, CONFIG.manifest, seed=7, scale=0.05)
 
-    hashes = spark_json(client, CONTENT_HASHES % TABLES, {"/a": a, "/b": b})
+    hashes = content_hashes(client, {"/a": a, "/b": b})
     assert hashes["/a"] == hashes["/b"]
     assert all(h is not None for h in hashes["/a"].values())
 
@@ -73,10 +59,7 @@ def test_generator_refuses_non_empty_catalog(client: docker.DockerClient, tmp_pa
         run_generator(client, CONFIG.executor.image, tmp_path, CONFIG.manifest, seed=1, scale=0.05)
 
 
-def test_scale_1_finishes_under_2_minutes(client: docker.DockerClient, tmp_path: Path) -> None:
+@pytest.mark.slow
+def test_scale_1_finishes_under_2_minutes(prod_scale_1: tuple[Path, float]) -> None:
     """Acceptance §11.4 (1). Integrity is checked inside the job; a violation fails it."""
-    start = time.monotonic()
-    run_generator(
-        client, CONFIG.executor.image, tmp_path, CONFIG.manifest, CONFIG.generator.seed, CONFIG.generator.scale
-    )
-    assert time.monotonic() - start < 120
+    assert prod_scale_1[1] < 120

@@ -51,3 +51,4 @@ metastore_db/
 .DS_Store
 dbrix.toml
 .pytest_tmp/
+.pytest_docker_tmp/
