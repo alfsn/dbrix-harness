@@ -13,7 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from sqlglot import exp
 
-from dbrix.config import CATALOG_META_FILE
+from dbrix.config import CATALOG_META_FILE, SamplingConfig
 
 
 class ManifestError(ValueError):
@@ -177,6 +177,13 @@ def validate(m: Manifest) -> list[str]:
     except graphlib.CycleError as e:
         errors.append(f"FK graph has a cycle: {' -> '.join(e.args[1])}")
     return errors
+
+
+def anchor_of(m: Manifest, sampling: SamplingConfig) -> Anchor:
+    """The anchor set in `sampling`, or the manifest's default_anchor (§4.1)."""
+    if sampling.anchor_table is None or sampling.anchor_key is None:
+        return m.default_anchor
+    return Anchor(table=sampling.anchor_table, key=sampling.anchor_key)
 
 
 def validate_anchor(m: Manifest, anchor: Anchor) -> list[str]:

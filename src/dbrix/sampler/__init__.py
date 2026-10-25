@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from dbrix.config import MANIFEST_MOUNT, PROD_CATALOG_MOUNT, SANDBOX_MOUNT, SamplingConfig
 from dbrix.ids import sandbox_id
 from dbrix.jobs import require_empty_dir, run_job
-from dbrix.manifest import Anchor, Manifest, load_manifest, read_catalog_meta, validate_anchor
+from dbrix.manifest import anchor_of, load_manifest, read_catalog_meta, validate_anchor
 
 
 class Sampling(BaseModel):
@@ -28,12 +28,6 @@ class Sampling(BaseModel):
 class SampleResult(BaseModel):
     sampling: Sampling
     row_counts: dict[str, int]
-
-
-def anchor_of(manifest: Manifest, sampling: SamplingConfig) -> Anchor:
-    if sampling.anchor_table is None or sampling.anchor_key is None:
-        return manifest.default_anchor
-    return Anchor(table=sampling.anchor_table, key=sampling.anchor_key)
 
 
 def run_sampler(

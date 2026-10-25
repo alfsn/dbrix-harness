@@ -18,8 +18,7 @@ from pyspark.sql import functions as F
 
 from dbrix.config import PROD_CATALOG_MOUNT, SANDBOX_MOUNT, SamplingConfig
 from dbrix.integrity import check_integrity, fk_keys
-from dbrix.manifest import Anchor, ForeignKey, Manifest, load_manifest
-from dbrix.sampler import anchor_of
+from dbrix.manifest import Anchor, ForeignKey, Manifest, anchor_of, load_manifest
 from dbrix.spark import create_schemas, create_session, table_path, unit, write_gold
 
 
@@ -95,18 +94,15 @@ def select(
     # 4. Up pass.
     up_pass(selected, prod, manifest)
 
-    # 5. Fill and islands, parents first.
+    # 5. Fill and islands, parents first, so every parent of `name` is already in `selected`.
     for name in order:
         if name in selected:
             continue
         t = manifest.tables[name]
-        if any(fk.ref_table in selected and not selected[fk.ref_table].isEmpty() for fk in t.foreign_keys):
+        if any(not selected[fk.ref_table].isEmpty() for fk in t.foreign_keys):
             # Fill: every non-null FK points at a selected row, and at least one FK is non-null.
             rows = prod[name].where(~reduce(operator.and_, map(is_null, t.foreign_keys)))
             for fk in t.foreign_keys:
-                if fk.ref_table not in selected:
-                    rows = rows.where(is_null(fk))
-                    continue
                 hits = fk_keys(selected[fk.ref_table], fk).withColumn("_hit", F.lit(True))
                 rows = rows.join(hits, fk.columns, "left").where(is_null(fk) | F.col("_hit")).drop("_hit")
             selected[name] = union([rows], t.primary_key)
