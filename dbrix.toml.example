@@ -23,3 +23,8 @@ result_file_max_rows = 10000
 
 [lifecycle]
 ttl_seconds = 86400
+
+[mcp]
+host  = "127.0.0.1"
+port  = 8765
+# token = "..."   # required for --transport http

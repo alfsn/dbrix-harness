@@ -17,6 +17,7 @@ agents = [
     "deepagents>=0.7.32",
     "langchain>=1.4.7",
     "langgraph>=1.2.17",
+    "mcp>=2.3.0",
 ]
 dev = [
     "mypy>=1.15.0",

@@ -22,8 +22,8 @@ description: How to query the prod_catalog medallion tables with Spark SQL or Py
 - Check `/catalog/<schema>/<table>.md` for the exact columns before you write a query.
 
 ## Results
-- The tool answer shows the first rows. The full result is at `/results/<id>.csv`; read it with `read_file`
-  (use offset and limit for long files).
+- The tool answer shows the first rows. The full result is at `/results/<id>.csv`; read it when you need more
+  (in parts, for long files).
 
 ## Errors
 - `SecurityException` errors name a rule and give a hint. Common ones:

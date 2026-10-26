@@ -12,12 +12,12 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.types import Command
 
+from dbrix.calls import RECREATED
 from dbrix.config import OperatingMode
 from dbrix.deepagents import create_sandboxed_deep_agent
 from dbrix.executor.client import remove_executors
 from dbrix.lifecycle import gc
 from dbrix.lifecycle.meta import read_meta, write_meta
-from dbrix.middleware import RECREATED
 from dbrix.sampler import SampleResult
 from tests.scripted import ScriptedModel, call
 

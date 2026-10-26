@@ -95,12 +95,12 @@ def agent_instructions(manifest: Manifest, mode: OperatingMode) -> str:
   events, silver clean entities, gold aggregates).
 - Always use 3-part table names: `{manifest.catalog}.<schema>.<table>`. 1- and 2-part names are rejected.
 - Table docs (columns, keys, relationships, sample rows): read `{CATALOG_PATH}/README.md` and
-  `{CATALOG_PATH}/<schema>/<table>.md` with read_file before writing queries.
+  `{CATALOG_PATH}/<schema>/<table>.md` before writing queries.
 
 ## Tools
 - `run_sql(query)`: Spark SQL. Several statements may be separated by `;`; you get the last one's result.
 - `run_pyspark(code)`: PySpark with `spark`, `F`, and `T` defined. Put the DataFrame to return in `result`.
-- Each result shows a preview; the full result is a CSV under `{RESULTS_PATH}/`, readable with read_file.
+- Each result shows a preview; the full result is a CSV under `{RESULTS_PATH}/`.
 - Errors come back with a hint. Fix the code and try again.
 
 ## Mode

@@ -37,6 +37,12 @@ RESULTS_DIR = "_results"  # in a sandbox dir; the agent sees it as RESULTS_PATH 
 RESULTS_PATH = "/results"
 CATALOG_DOCS_DIR = "_catalog"  # in a sandbox dir; the agent sees it as CATALOG_PATH (§8.4)
 CATALOG_PATH = "/catalog"
+SKILLS_DIR = Path(__file__).parent / "skills"  # packaged; the agent sees it as SKILLS_PATH (§8.4)
+SKILLS_PATH = "/skills"
+
+# MCP server (§8.5): one sandbox per process, as agent `mcp`; files are resources at `dbrix:/<agent path>`.
+MCP_AGENT_ID = "mcp"
+RESOURCE_SCHEME = "dbrix"
 SAMPLE_ROWS = 5  # per table in the catalog docs
 
 # Sandbox root layout (§4.3, §9).
@@ -98,6 +104,12 @@ class LifecycleConfig(_Section):
     ttl_seconds: PositiveInt = 86400  # from last activity (§9.4)
 
 
+class McpConfig(_Section):
+    host: str = "127.0.0.1"
+    port: PositiveInt = 8765
+    token: str | None = None  # required for --transport http
+
+
 class Config(_Section):
     prod_catalog_dir: Path = Path("./prod_catalog")
     sandbox_root: Path = Path("./sandbox_catalog")
@@ -107,6 +119,7 @@ class Config(_Section):
     sampling: SamplingConfig = SamplingConfig()
     executor: ExecutorConfig = ExecutorConfig()
     lifecycle: LifecycleConfig = LifecycleConfig()
+    mcp: McpConfig = McpConfig()
 
 
 def load_config(path: Path = Path("dbrix.toml")) -> Config:

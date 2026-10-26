@@ -2,7 +2,6 @@
 DbrixSandboxMiddleware on the main agent and on every subagent."""
 
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 from deepagents import CompiledSubAgent, FilesystemPermission, SubAgent, create_deep_agent
@@ -17,12 +16,15 @@ from langgraph.config import get_config
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Checkpointer
 
+from dbrix.calls import DEFAULT_TOOLS
 from dbrix.catalog_docs import agent_instructions
 from dbrix.config import (
     CATALOG_DOCS_DIR,
     CATALOG_PATH,
     RESULTS_DIR,
     RESULTS_PATH,
+    SKILLS_DIR,
+    SKILLS_PATH,
     Config,
     OperatingMode,
     SamplingConfig,
@@ -30,11 +32,8 @@ from dbrix.config import (
 )
 from dbrix.lifecycle.manager import SandboxManager
 from dbrix.manifest import load_manifest
-from dbrix.middleware import DEFAULT_TOOLS, DbrixSandboxMiddleware, stream_build_event
+from dbrix.middleware import DbrixSandboxMiddleware, stream_build_event
 from dbrix.middleware.tools import run_pyspark, run_sql
-
-SKILLS_DIR = Path(__file__).parent / "skills"
-SKILLS_PATH = "/skills"
 
 EXPLORER: SubAgent = {
     "name": "explorer",

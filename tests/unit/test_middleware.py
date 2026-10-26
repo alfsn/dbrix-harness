@@ -1,8 +1,6 @@
 """DbrixSandboxMiddleware on plain create_agent, with a scripted model and a fake manager: no Docker (§8.2, §8.3)."""
 
 import asyncio
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,48 +10,13 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from dbrix.config import Config, OperatingMode
-from dbrix.executor.protocol import RunRequest, RunResult
+from dbrix.calls import RECREATED
+from dbrix.config import OperatingMode
 from dbrix.ids import InvalidSandboxIdError
-from dbrix.lifecycle.manager import Sandbox
-from dbrix.lifecycle.runlog import Approval, RunRecord
-from dbrix.middleware import RECREATED, DbrixSandboxMiddleware
+from dbrix.middleware import DbrixSandboxMiddleware
 from dbrix.middleware.tools import NotSandboxedError, run_pyspark, run_sql
+from tests.fakes import T0, FakeManager
 from tests.scripted import ScriptedModel, call
-
-T0 = datetime(2026, 10, 26, tzinfo=UTC)
-
-
-class FakeManager:
-    def __init__(self) -> None:
-        self.cfg = Config()
-        self.created_at = T0
-        self.runs: list[tuple[RunRequest, Approval | None]] = []
-        self.logged: list[RunRecord] = []
-        self.builds = 0
-
-    def sandbox(self, agent_id: str, session_id: str) -> Sandbox:
-        return Sandbox(agent_id, session_id, Path(f"/x/agent_{agent_id}_{session_id}"), self.created_at)
-
-    def get_or_create(self, agent_id: str, session_id: str, on_build: Any) -> Sandbox:
-        if self.builds == 0:
-            on_build(f"agent_{agent_id}_{session_id}")
-        self.builds += 1
-        return self.sandbox(agent_id, session_id)
-
-    def run(self, sandbox: Sandbox, request: RunRequest, tool: str, mode: Any, approval: Any, on_build: Any) -> Any:
-        self.runs.append((request, approval))
-        result = RunResult(
-            ok=True,
-            preview_markdown="| x |\n| --- |\n| 1 |",
-            row_count=1,
-            full_result_path=f"/results/{request.run_id}.csv",
-            duration_ms=1,
-        )
-        return self.sandbox(sandbox.agent_id, sandbox.session_id), result
-
-    def log_run(self, sandbox: Sandbox, record: RunRecord) -> None:
-        self.logged.append(record)
 
 
 @tool
@@ -87,10 +50,7 @@ def test_read_runs_and_formats_the_result() -> None:
     state = invoke(agent(m, OperatingMode.READ_ONLY, call("run_sql", {"query": "SELECT 1"})), START)
     [msg] = tool_messages(state)
     assert msg.status == "success"
-    assert (
-        msg.content
-        == "| x |\n| --- |\n| 1 |\n\n1 rows total, showing 1; full result at /results/c1.csv (read with read_file)"
-    )
+    assert msg.content == "| x |\n| --- |\n| 1 |\n\n1 rows total, showing 1; full result at /results/c1.csv"
     [(request, approval)] = m.runs
     assert (request.run_id, request.allow_writes, approval) == ("c1", False, None)
     assert state["dbrix_sandbox_created_at"] == T0.isoformat()
