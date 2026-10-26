@@ -564,7 +564,7 @@ The class name `SandboxSecurityException` is not shown to the agent: `AgentError
 
 ```
 --network none
---read-only  --tmpfs /tmp:rw,size=1g
+--read-only  --tmpfs /tmp:rw,exec,nosuid,size=1g          # exec: Spark loads native codecs from /tmp
 --mount type=bind,src=<sandbox_dir>,dst=/sandbox      # only data mount
 --user 10001:10001
 --cap-drop ALL  --security-opt no-new-privileges
@@ -917,3 +917,4 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 48 | Reverse mapping of stdout | — | Always applied (option A); quoted names and `file:` paths are covered |
 | 49 | Policy-disabled red-team runs | — | The check function is passed to the runtime at startup; tests pass a no-op one. No flag the agent can reach |
 | 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
+| 51 | Executor `/tmp` | `rw,size=1g` | `rw,exec,nosuid,size=1g`: Docker's tmpfs default is `noexec`, and Spark's snappy/lz4/zstd load a native library they unpack into `/tmp`. No new capability: `/sandbox` already allows exec |

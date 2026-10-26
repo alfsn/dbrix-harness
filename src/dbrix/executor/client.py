@@ -73,7 +73,7 @@ def start_executor(
         ["python", "-m", "dbrix.executor.runtime", catalog, str(cfg.preview_rows), str(cfg.result_file_max_rows)],
         stdin_open=True,
         read_only=True,
-        tmpfs={"/tmp": "rw,size=1g"},
+        tmpfs={"/tmp": "rw,exec,nosuid,size=1g"},  # exec: Spark loads native codecs (snappy, lz4) from /tmp
         volumes={str(sandbox_dir.resolve()): {"bind": SANDBOX_MOUNT, "mode": "rw"}},
         user="10001:10001",
         cap_drop=["ALL"],
