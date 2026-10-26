@@ -11,6 +11,7 @@ from pathlib import Path
 
 import docker
 from docker.models.containers import Container
+from pydantic import ValidationError
 
 from dbrix.config import (
     EXECUTOR_START_TIMEOUT,
@@ -105,6 +106,12 @@ def restart_executor(client: docker.DockerClient, executor: Executor) -> None:
     _wait_ready(executor)
 
 
+def remove_executors(client: docker.DockerClient, sandbox_id: str) -> None:
+    """Remove every container of the sandbox, running or stopped."""
+    for c in client.containers.list(all=True, filters={"label": f"{SANDBOX_LABEL}={sandbox_id}"}):
+        c.remove(force=True)
+
+
 def _attach(client: docker.DockerClient, container: Container) -> socket.socket:
     """Attach, then start, so no line is lost (§6.3)."""
     sock = client.api.attach_socket(str(container.id), params={"stdin": 1, "stdout": 1, "stream": 1})
@@ -127,13 +134,15 @@ def run(executor: Executor, request: RunRequest, timeout: float) -> RunResult:
     """Send one request. When no answer comes within `timeout` seconds (ExecutorTimeout) or the answer is broken
     (ExecutorError), the container is stopped: its output can't be trusted to line up any more. The caller
     restarts it with `restart_executor`."""
-    executor.sock.sendall(request.model_dump_json().encode() + b"\n")
     try:
-        line = _read_line(executor, timeout)
+        try:
+            executor.sock.sendall(request.model_dump_json().encode() + b"\n")
+            result = RunResult.model_validate_json(_read_line(executor, timeout))
+        except (OSError, ValidationError) as e:  # a closed socket (the container stopped), or garbage
+            raise ExecutorError(f"broken answer from the executor: {e}") from e
+        if result.full_result_path not in (None, f"{RESULTS_PATH}/{request.run_id}.csv"):
+            raise ExecutorError(f"unexpected result path from the executor: {result.full_result_path!r}")
     except ExecutorError:
         executor.container.stop(timeout=0)
         raise
-    result = RunResult.model_validate_json(line)
-    if result.full_result_path not in (None, f"{RESULTS_PATH}/{request.run_id}.csv"):
-        raise ExecutorError(f"unexpected result path from the executor: {result.full_result_path!r}")
     return result

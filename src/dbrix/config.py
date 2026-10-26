@@ -1,6 +1,7 @@
 """Every default and constant lives here, nowhere else (§10)."""
 
 import tomllib
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -35,11 +36,26 @@ CATALOG_META_FILE = "_catalog_meta.json"
 RESULTS_DIR = "_results"  # in a sandbox dir; the agent sees it as RESULTS_PATH (§8.4)
 RESULTS_PATH = "/results"
 
+# Sandbox root layout (§4.3, §9).
+SANDBOX_META_FILE = "_sandbox_meta.json"
+RUNS_FILE = "runs.jsonl"
+LOCKS_DIR = ".locks"
+CREATING_PREFIX = ".creating-"
+EXECUTORS_LOCK = "_executors"  # lock name for the container limit; sandbox ids start with `agent_`, so no clash
+SLOT_RETRY_SECONDS = 1.0  # how often a call waiting for a free executor slot looks again
+
 # Executor (§6.3).
 SANDBOX_LABEL = "dbrix.sandbox_id"
 EXECUTOR_START_TIMEOUT = 300  # seconds until the runtime's ready line (Spark start)
 MAX_RESPONSE_BYTES = 1_000_000  # one response line from the untrusted executor
 OUTPUT_LIMIT = 8192  # characters of stdout and of stderr kept per run
+
+
+class OperatingMode(StrEnum):
+    """Set by the host per tool call, never by the agent (§8.2)."""
+
+    READ_ONLY = "READ_ONLY"
+    READ_WRITE = "READ_WRITE"
 
 
 class _Section(BaseModel):
@@ -68,18 +84,26 @@ class SamplingConfig(_Section):
 class ExecutorConfig(_Section):
     image: str = "dbrix-spark:0.1"
     run_timeout: PositiveInt = 120  # seconds of running time per run
+    max_containers: PositiveInt = 2  # executor containers running at once, across host processes
     memory: str = "4g"
     cpus: float = Field(default=2, gt=0)
     preview_rows: PositiveInt = 50
     result_file_max_rows: PositiveInt = 10000
 
 
+class LifecycleConfig(_Section):
+    ttl_seconds: PositiveInt = 86400  # from last activity (§9.4)
+
+
 class Config(_Section):
     prod_catalog_dir: Path = Path("./prod_catalog")
+    sandbox_root: Path = Path("./sandbox_catalog")
     manifest: Path = Path("./manifests/influencer_marketing.yaml")
+    default_mode: OperatingMode = OperatingMode.READ_ONLY
     generator: GeneratorConfig = GeneratorConfig()
     sampling: SamplingConfig = SamplingConfig()
     executor: ExecutorConfig = ExecutorConfig()
+    lifecycle: LifecycleConfig = LifecycleConfig()
 
 
 def load_config(path: Path = Path("dbrix.toml")) -> Config:

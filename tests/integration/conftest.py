@@ -8,12 +8,14 @@ import docker
 import pytest
 import requests
 
-from dbrix.config import Config, SamplingConfig
+from dbrix.config import Config
 from dbrix.executor.build_image import build_image
 from dbrix.generator import run_generator
 from dbrix.jobs import run_job
+from dbrix.lifecycle.manager import SandboxManager
+from dbrix.lifecycle.meta import read_meta
 from dbrix.manifest import load_manifest
-from dbrix.sampler import SampleResult, run_sampler
+from dbrix.sampler import SampleResult
 
 REPO = Path(__file__).parents[2]
 CONFIG = Config()
@@ -46,20 +48,14 @@ def prod_small(client: docker.DockerClient, tmp_path_factory: pytest.TempPathFac
 def sandbox_small(
     client: docker.DockerClient, prod_small: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> tuple[Path, SampleResult]:
-    """The one real sandbox build of the suite, built in `.creating-a` and renamed as the lifecycle layer does.
-    Tests that change it work on a copy."""
+    """The one real sandbox build of the suite, through the lifecycle layer (§9.5). Tests that change it work on a
+    copy."""
     root = tmp_path_factory.mktemp("sandbox_small")
-    result = run_sampler(
-        client,
-        CONFIG.executor.image,
-        prod_small,
-        root / ".creating-a",
-        CONFIG.manifest,
-        "agent",
-        "s1",
-        SamplingConfig(),
-    )
-    return (root / ".creating-a").rename(root / "agent_agent_s1"), result
+    cfg = CONFIG.model_copy(update={"prod_catalog_dir": prod_small, "sandbox_root": root})
+    sandbox = SandboxManager(cfg, client).get_or_create("agent", "s1")
+    meta = read_meta(sandbox.dir)
+    assert meta.status == "IDLE" and meta.sampling and not (root / ".creating-agent_agent_s1").exists()
+    return sandbox.dir, SampleResult(sampling=meta.sampling, row_counts=meta.row_counts)
 
 
 @pytest.fixture(scope="session")
