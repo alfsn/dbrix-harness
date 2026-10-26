@@ -196,17 +196,16 @@ print(json.dumps({
 """
 
 
-def test_sandbox_end_to_end(client: docker.DockerClient, prod_small: Path, tmp_path: Path) -> None:
-    """One real build. Determinism of the rows is checked in memory by test_five_seeds."""
-    result = sample(client, prod_small, tmp_path / ".creating-a")
+def test_sandbox_end_to_end(client: docker.DockerClient, sandbox_small: tuple[Path, SampleResult]) -> None:
+    """The real build. Determinism of the rows is checked in memory by test_five_seeds."""
+    sandbox, result = sandbox_small
 
     # The meta block is complete.
     assert result.sampling.anchor_table == "silver.brands" and result.sampling.sample_size == 5
     assert result.sampling.prod_table_versions and set(result.row_counts) == set(TABLES)
 
-    # After a rename, a new Spark session opens the sandbox metastore at /sandbox and Gold matches its transform.
-    (tmp_path / ".creating-a").rename(tmp_path / "agent_agent_s1")
-    mounts = {"/sandbox": tmp_path / "agent_agent_s1", "/repo/manifests": REPO / "manifests"}
+    # After the rename, a new Spark session opens the sandbox metastore at /sandbox and Gold matches its transform.
+    mounts = {"/sandbox": sandbox, "/repo/manifests": REPO / "manifests"}
     checks = spark_json(client, SANDBOX_CHECKS, mounts, catalog_dir="/sandbox")
     assert checks["seed_of_ids"] == result.sampling.seed  # the seed comes from the ids, so a rebuild matches
     assert checks["row_counts"] == result.row_counts

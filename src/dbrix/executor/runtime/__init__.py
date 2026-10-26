@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import traceback
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -18,12 +19,17 @@ from pyspark.sql import types as T
 
 from dbrix.config import OUTPUT_LIMIT, RESULTS_DIR, RESULTS_PATH, SANDBOX_MOUNT
 from dbrix.executor.protocol import AgentError, Column, RunRequest, RunResult
+from dbrix.executor.runtime.wrap import RunState, install
 from dbrix.policy import SandboxSecurityException
 from dbrix.policy.sql import split_statements
 from dbrix.rewrite import reverse_map
 from dbrix.spark import create_session
 
 AGENT_FILE = "<agent>"  # the file name agent code is compiled with, so tracebacks show only its frames
+
+# Patches Spark for agent code and returns the per-run state. The host picks it at startup: the red-team
+# containment test runs without the wrapper (§11.3).
+Install = Callable[[SparkSession, str], RunState]
 
 
 def run_sql(spark: SparkSession, code: str) -> DataFrame | None:
@@ -88,8 +94,11 @@ def _error(e: Exception, catalog: str) -> AgentError:
     return AgentError(type=type(e).__name__, message=reverse_map(f"{where}{e}", catalog))
 
 
-def run(spark: SparkSession, request: RunRequest, catalog: str, preview_rows: int, max_rows: int) -> RunResult:
+def run(
+    spark: SparkSession, state: RunState, request: RunRequest, catalog: str, preview_rows: int, max_rows: int
+) -> RunResult:
     start = time.monotonic()
+    state.allow_writes, state.rewritten_sql, state.writes_applied = request.allow_writes, [], []
     out, err = io.StringIO(), io.StringIO()
     result: dict[str, Any] = {}
     try:
@@ -112,19 +121,22 @@ def run(spark: SparkSession, request: RunRequest, catalog: str, preview_rows: in
         stdout=reverse_map(out.getvalue()[:OUTPUT_LIMIT], catalog),
         stderr=reverse_map(err.getvalue()[:OUTPUT_LIMIT], catalog),
         duration_ms=int((time.monotonic() - start) * 1000),
+        rewritten_sql=state.rewritten_sql,
+        writes_applied=state.writes_applied,
         **result,
     )
 
 
-def serve(catalog: str, preview_rows: int, max_rows: int) -> None:
+def serve(catalog: str, preview_rows: int, max_rows: int, install: Install = install) -> None:
     """Answer one RunResult line per RunRequest line until stdin closes."""
     # Before Spark starts: the protocol gets a private copy of fd 1, and fd 1 goes to stderr (§6.3).
     protocol = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)
     spark = create_session(SANDBOX_MOUNT)
+    state = install(spark, catalog)
     protocol.write('{"ready": true}\n')
     protocol.flush()
     for line in sys.stdin:
-        result = run(spark, RunRequest.model_validate_json(line), catalog, preview_rows, max_rows)
+        result = run(spark, state, RunRequest.model_validate_json(line), catalog, preview_rows, max_rows)
         protocol.write(result.model_dump_json() + "\n")
         protocol.flush()

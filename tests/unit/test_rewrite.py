@@ -84,6 +84,13 @@ def test_rewrite_sql_blocks(sql: str, hint: str) -> None:
     assert (e.value.rule_id, e.value.hint) == ("TABLE_NAME_NOT_ALLOWED", hint)
 
 
+def test_rewrite_sql_one_statement() -> None:
+    assert rewrite_sql("SELECT 1;", CATALOG, temp_views) == "SELECT 1"
+    with pytest.raises(SandboxSecurityException) as e:
+        rewrite_sql("SELECT * FROM prod_catalog.silver.posts; SELECT 2", CATALOG, temp_views)
+    assert e.value.rule_id == "SQL_MULTIPLE_STATEMENTS"
+
+
 def test_rewrite_name() -> None:
     assert rewrite_name("prod_catalog.gold.s", CATALOG, temp_views) == "gold.s"
     assert rewrite_name("v", CATALOG, temp_views) == "v"

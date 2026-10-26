@@ -459,7 +459,7 @@ The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `Da
 - **Lowest entry point only.** It patches the classes, at the method the others call (for example `spark.table` calls `DataFrameReader.table`, so only that is patched). Each name is checked and rewritten exactly once; a test proves it.
 - **Path methods are blocked at runtime too.** The reader and writer path methods (§5.4 `PATH_METHODS`) always raise. This closes the alias gap of §5.5 (`w = df.write; w.save(p)`), so `allow_writes` holds for every write.
 - **`spark.sql` takes only the query string.** Extra arguments (`args=`, `{name}` keyword formatting) are blocked with the hint "use one SQL string", because they hide table names from the rewrite.
-- **The check function is passed in at startup** (`policy.check` by default). The red-team containment tests (§11.3) start the runtime with a no-op check instead; the agent has no way to choose it.
+- **The wrapper is passed in at startup** (`install`). The red-team containment tests (§11.3) start the runtime without it: raw Spark, no checks, rewrites, or blocks. The host picks it in the start command; the agent has no way to choose it.
 
 For each SQL string (parsed with sqlglot) or table name, the wrapper:
 1. runs `policy.check` on it (§5.2), and blocks writes if `allow_writes` is false;
@@ -818,7 +818,7 @@ ttl_seconds = 86400
 ### 11.3 Red team (must all fail to touch prod or escape)
 `getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `df.write.saveAsTable(…, path="/x")`, `df.write.options(**{"path": "/x"})`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
 
-For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own. The containment test sends requests straight to the executor client (no middleware) and starts the runtime with a no-op check (§6.1), with the same isolation flags as a normal executor.
+For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own. The containment test sends requests straight to the executor client (no middleware) and starts the runtime without the wrapper (§6.1), with the same isolation flags as a normal executor.
 
 ### 11.4 Acceptance (v0 is done when)
 1. `python -m dbrix.generator` at scale 1 finishes in under 2 min and passes integrity checks.
@@ -915,6 +915,6 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 46 | Stray fd 1 output | capture file in `/tmp` | Pointed at stderr (`docker logs`): same protection, nothing fills `/tmp` |
 | 47 | Default table format | — | `spark.sql.sources.default=delta`, as on Databricks |
 | 48 | Reverse mapping of stdout | — | Always applied (option A); quoted names and `file:` paths are covered |
-| 49 | Policy-disabled red-team runs | — | The check function is passed to the runtime at startup; tests pass a no-op one. No flag the agent can reach |
+| 49 | Policy-disabled red-team runs | — | The wrapper is passed to the runtime at startup; containment tests run without it (raw Spark), the strictest case. No flag the agent can reach |
 | 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
 | 51 | Executor `/tmp` | `rw,size=1g` | `rw,exec,nosuid,size=1g`: Docker's tmpfs default is `noexec`, and Spark's snappy/lz4/zstd load a native library they unpack into `/tmp`. No new capability: `/sandbox` already allows exec |

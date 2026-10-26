@@ -8,11 +8,12 @@ import docker
 import pytest
 import requests
 
-from dbrix.config import Config
+from dbrix.config import Config, SamplingConfig
 from dbrix.executor.build_image import build_image
 from dbrix.generator import run_generator
 from dbrix.jobs import run_job
 from dbrix.manifest import load_manifest
+from dbrix.sampler import SampleResult, run_sampler
 
 REPO = Path(__file__).parents[2]
 CONFIG = Config()
@@ -39,6 +40,26 @@ def prod_small(client: docker.DockerClient, tmp_path_factory: pytest.TempPathFac
     path = tmp_path_factory.mktemp("prod_small")
     run_generator(client, CONFIG.executor.image, path, CONFIG.manifest, seed=3, scale=0.2)
     return path
+
+
+@pytest.fixture(scope="session")
+def sandbox_small(
+    client: docker.DockerClient, prod_small: Path, tmp_path_factory: pytest.TempPathFactory
+) -> tuple[Path, SampleResult]:
+    """The one real sandbox build of the suite, built in `.creating-a` and renamed as the lifecycle layer does.
+    Tests that change it work on a copy."""
+    root = tmp_path_factory.mktemp("sandbox_small")
+    result = run_sampler(
+        client,
+        CONFIG.executor.image,
+        prod_small,
+        root / ".creating-a",
+        CONFIG.manifest,
+        "agent",
+        "s1",
+        SamplingConfig(),
+    )
+    return (root / ".creating-a").rename(root / "agent_agent_s1"), result
 
 
 @pytest.fixture(scope="session")

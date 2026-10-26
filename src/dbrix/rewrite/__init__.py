@@ -16,6 +16,7 @@ from dbrix.policy.sql import (
     parse_table,
     split_command,
     split_explain,
+    split_statements,
     tables,
 )
 
@@ -65,7 +66,12 @@ def _show_schema(what: str, name: str, catalog: str) -> str:
 
 def rewrite_sql(statement: str, catalog: str, is_temp_view: IsTempView) -> str:
     """One statement with every table name resolved and `current_catalog()` replaced (§6.1).
-    Raises SandboxSecurityException for a name outside `catalog`."""
+    Raises SandboxSecurityException for a name outside `catalog`, or for more than one statement."""
+    if len(split_statements(statement)) > 1:
+        hint = "run one statement per spark.sql call"
+        raise SandboxSecurityException(
+            "SQL_MULTIPLE_STATEMENTS", "one statement at a time", "sql", None, statement, hint
+        )
     stmt = parse_statement(statement)
     if not isinstance(stmt, exp.Command):
         skip = _view_target(stmt)
