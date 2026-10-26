@@ -547,6 +547,7 @@ The agent should never see that it is not on Databricks `prod_catalog`. The plac
 | Paths (`/sandbox/silver/posts`, `file:/sandbox/...`) in any text | `/sandbox/<schema>/<table>` → `prod_catalog.<schema>.<table>`; any other `/sandbox` path → `<sandbox>` |
 | Output rows of `SHOW`, `DESCRIBE` (incl. `DETAIL`, `HISTORY`, `EXTENDED`), `EXPLAIN` | The same reverse mapping is applied to every string value in these results, so `SHOW CATALOGS` returns `prod_catalog` and locations hide sandbox paths |
 | stdout and stderr | Same reverse mapping, always, even when the agent prints data rows (rare false matches are accepted) |
+| PySpark's own error log (`DataFrameQueryContextLogger`, `SQLQueryContextLogger`), which prints every Spark error to stderr with the JVM stack trace and container paths | Disabled in the executor runtime; the error reaches the agent once, as `AgentError` |
 | `current_catalog()` | Rewritten to `'prod_catalog'` (§6.1) |
 | `input_file_name()` and related, `_metadata` column | Blocked by the policy (§5.3), with a hint |
 | Catalog docs (`/catalog/`) | Always generated with prod names |
@@ -940,3 +941,4 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 65 | `AGENTS.md` | `memory=` | Generated text passed as the system prompt |
 | 66 | Enforcement test | inspect graph nodes | Check subagent specs before building; reject compiled subagents that have a code tool |
 | 67 | READ_ONLY and dynamic SQL | — | Static writes: error before running. Dynamic SQL only: runs with `allow_writes=false` |
+| 68 | PySpark's error log | printed to stderr | Disabled in the runtime: it repeated every Spark error with the JVM stack trace and container paths (§6.5) |

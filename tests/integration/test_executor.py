@@ -95,6 +95,20 @@ def test_errors_are_results(executor: Executor) -> None:
     assert (r.error.type, r.error.message) == ("ZeroDivisionError", "line 2: division by zero")
 
 
+@pytest.mark.parametrize(
+    ("language", "code"),
+    [
+        ("sql", "SELECT no_such_column FROM prod_catalog.silver.brands"),
+        ("pyspark", 'spark.table("prod_catalog.silver.brands").select("no_such_column")'),
+    ],
+)
+def test_spark_errors_log_nothing(executor: Executor, language: Language, code: str) -> None:
+    """PySpark's own error log (JVM stack trace, container paths) does not reach stderr (§6.5)."""
+    r = call(executor, language, code)
+    assert not r.ok and r.error and "no_such_column" in r.error.message
+    assert r.stderr == "", r.stderr
+
+
 # The wrapper (§6.1)
 
 

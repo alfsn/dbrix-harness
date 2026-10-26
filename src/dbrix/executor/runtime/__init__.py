@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
+from pyspark.logger import PySparkLogger
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -26,6 +27,8 @@ from dbrix.rewrite import reverse_map
 from dbrix.spark import create_session, flatten, markdown_table
 
 AGENT_FILE = "<agent>"  # the file name agent code is compiled with, so tracebacks show only its frames
+# PySpark logs every Spark error to stderr from these, with the JVM stack trace and container paths (§6.5).
+ERROR_LOGGERS = ("DataFrameQueryContextLogger", "SQLQueryContextLogger")
 
 # Patches Spark for agent code and returns the per-run state. The host picks it at startup: the red-team
 # containment test runs without the wrapper (§11.3).
@@ -117,6 +120,8 @@ def serve(catalog: str, preview_rows: int, max_rows: int, install: Install = ins
     protocol = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)
     spark = create_session(SANDBOX_MOUNT)
+    for name in ERROR_LOGGERS:
+        PySparkLogger.getLogger(name).disabled = True
     state = install(spark, catalog)
     protocol.write('{"ready": true}\n')
     protocol.flush()

@@ -9,7 +9,7 @@ from typing import Any
 
 import docker
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.types import Command
 
 from dbrix.config import OperatingMode
@@ -44,7 +44,7 @@ def messages(state: dict[str, Any]) -> dict[str, ToolMessage]:
 
 
 def test_deep_agent_end_to_end(client: docker.DockerClient, prod_small: Path, root: Path) -> None:
-    script = [
+    script: list[BaseMessage] = [
         call("read_file", {"file_path": "/catalog/silver/brands.md"}, "doc"),
         call("run_sql", {"query": "SELECT COUNT(*) AS n FROM prod_catalog.silver.brands"}, "count"),
         call("read_file", {"file_path": "/results/count.csv"}, "csv"),
@@ -60,7 +60,7 @@ def test_deep_agent_end_to_end(client: docker.DockerClient, prod_small: Path, ro
         AIMessage("done again"),
     ]
     cfg = CONFIG.model_copy(update={"sandbox_root": root, "prod_catalog_dir": prod_small})
-    agent = create_sandboxed_deep_agent(
+    agent: Any = create_sandboxed_deep_agent(
         ScriptedModel(responses=script), mode=OperatingMode.READ_WRITE, config=cfg, docker=client
     )
 
