@@ -65,12 +65,20 @@ def _read_line(executor: Executor, timeout: float) -> bytes:
 
 
 def start_executor(
-    client: docker.DockerClient, image: str, sandbox_dir: Path, sandbox_id: str, catalog: str, cfg: ExecutorConfig
+    client: docker.DockerClient,
+    image: str,
+    sandbox_dir: Path,
+    sandbox_id: str,
+    catalog: str,
+    cfg: ExecutorConfig,
+    command: list[str] | None = None,
 ) -> Executor:
-    """Start the runtime with the §7 isolation and wait until Spark is ready."""
+    """Start the runtime with the §7 isolation and wait until Spark is ready. `command` replaces the runtime's start
+    command: the red-team containment tests start it without the wrapper (§6.1)."""
     container = client.containers.create(
         image,
-        ["python", "-m", "dbrix.executor.runtime", catalog, str(cfg.preview_rows), str(cfg.result_file_max_rows)],
+        command
+        or ["python", "-m", "dbrix.executor.runtime", catalog, str(cfg.preview_rows), str(cfg.result_file_max_rows)],
         stdin_open=True,
         read_only=True,
         tmpfs={"/tmp": "rw,exec,nosuid,size=1g"},  # exec: Spark loads native codecs (snappy, lz4) from /tmp

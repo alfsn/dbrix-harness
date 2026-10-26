@@ -1,5 +1,5 @@
 """The §11.3 red-team cases, as data. The policy must block or flag each one (test_policy_blocks.py); with the
-policy disabled, the container must still contain it (Phase 4)."""
+policy disabled, the container must still contain it (tests/integration/test_containment.py)."""
 
 from dbrix.policy.report import Language
 
