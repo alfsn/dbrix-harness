@@ -20,7 +20,7 @@ The agent's code needs no changes. It believes it is talking to `prod_catalog` (
 | In v0 | Deferred (see §13) |
 |---|---|
 | One engine: **local PySpark + delta-spark** (closest to Databricks) | DuckDB engine |
-| One front door: **middleware** (LangChain v1 `AgentMiddleware`) plus the `create_sandboxed_deep_agent` factory | MCP server, CLI, Claude Agent SDK adapter, generic decorator |
+| Two front doors over one core (`dbrix.calls`): **middleware** (LangChain v1 `AgentMiddleware`) plus the `create_sandboxed_deep_agent` factory, and a READ_ONLY **MCP server** (§8.5) | CLI, Claude Agent SDK adapter, generic decorator, writes over MCP |
 | READ_ONLY and **READ_WRITE with human approval** | — |
 | Docker isolation, adversarial threat model | gVisor/nsjail |
 | Bronze / Silver / Gold, with flat key columns in Bronze | Messy nested-JSON Bronze |
@@ -76,16 +76,16 @@ Both containers use one image, `dbrix-spark`, in two roles. The host needs no JV
 ### Request flow (one tool call)
 
 1. The agent calls `run_sql(query=…)` or `run_pyspark(code=…)`.
-2. `DbrixSandboxMiddleware.wrap_tool_call` intercepts it. The real tool body never runs.
+2. A front door receives it and calls `dbrix.calls.answer`, which runs steps 3–8: `DbrixSandboxMiddleware.wrap_tool_call` (the real tool body never runs), or the MCP server's tool (§8.5).
 3. `SandboxManager.get_or_create(agent_id, session_id)`: on first use, run the sampler (jobs container) and start the executor (Phases 2 and 5). Safe to call twice (§9.5).
 4. `policy.check(code, language)` returns a `PolicyReport` (reads, writes, dynamic SQL) or raises `SandboxSecurityException` (Phase 3). It does not know the mode.
 5. The middleware applies the mode for this call:
    - READ_ONLY and the report has writes → error back to the agent.
-   - READ_WRITE and the report has writes (or dynamic SQL that may write) → **LangGraph interrupt** for human approval (§8.3).
+   - READ_WRITE and the report has writes (or dynamic SQL that may write) → the front door's `approve` callback: a **LangGraph interrupt** for human approval (§8.3).
 6. The executor client sends `{run_id, language, code, allow_writes}` to the container. `allow_writes` is true only in READ_WRITE after approval.
 7. In the container, the runtime wrapper checks and rewrites every SQL string and table name as it is used (§6.1), runs the code, and writes the full result to `/results/<run_id>.csv`.
 8. The lifecycle layer appends to `runs.jsonl` and updates `_sandbox_meta.json`.
-9. The middleware returns a `ToolMessage` with the preview, the path to the full result, and any error. All names are shown as prod names (§6.5).
+9. `answer` returns the text (preview, path to the full result, any error) and whether it is an error. The middleware wraps it in a `ToolMessage`; the MCP server in a tool result. All names are shown as prod names (§6.5).
 
 ---
 
@@ -107,8 +107,10 @@ dbrix-harness/
 │   ├── executor/      # client.py (host), runtime/ (in container)
 │   ├── lifecycle/     # Phase 5: manager.py, meta.py, runlog.py, gc.py, locks.py
 │   ├── catalog_docs/  # /catalog markdown (written by the sampler job), the agent instructions
+│   ├── calls.py       # answer(): one tool call, steps 3–8 of §1; no agent framework
 │   ├── middleware/    # DbrixSandboxMiddleware, tools.py (fail-closed stubs)
 │   ├── deepagents.py  # create_sandboxed_deep_agent(...)
+│   ├── mcp_server/    # the MCP server (§8.5)
 │   └── skills/databricks-analyst/SKILL.md
 ├── examples/
 │   ├── deep_agent_demo.py
@@ -116,7 +118,7 @@ dbrix-harness/
 └── tests/ (unit/, integration/, redteam/)
 ```
 
-Module entry points, not a CLI product: `python -m dbrix.generator`, `python -m dbrix.lifecycle.gc`, `python -m dbrix.executor.build_image`.
+Module entry points, not a CLI product: `python -m dbrix.generator`, `python -m dbrix.lifecycle.gc`, `python -m dbrix.executor.build_image`, `python -m dbrix.mcp_server`.
 
 ---
 
@@ -669,7 +671,23 @@ It configures:
 
 The same middleware also works with plain `langchain.agents.create_agent` (see `examples/langchain_agent_demo.py`). The backend, memory, skill, and subagent features are Deep Agents-only.
 
-Checked against Deep Agents 0.7.32. The agent libraries (`langchain`, `langgraph`, `deepagents`) are a host-only dependency group (`agents`); the `dbrix-spark` image installs no default group (§6.3).
+Checked against Deep Agents 0.7.32. The agent libraries (`langchain`, `langgraph`, `deepagents`, `mcp`) are a host-only dependency group (`agents`); the `dbrix-spark` image installs no default group (§6.3).
+
+### 8.5 MCP server
+
+`python -m dbrix.mcp_server --transport stdio|http` lets any MCP client (Claude Code, Claude Desktop) use the sandbox. The client is the agent; dbrix answers its code tools and serves its own docs, so nothing from dbrix is installed on the client. Built on the official `mcp` SDK's `MCPServer`.
+
+- **One core.** The middleware and the MCP server are thin front doors over `dbrix.calls.answer` (§1). Policy, mode, logging, formatting, and the recreation notice live there once.
+- **READ_ONLY only.** The mode is fixed, not read from `default_mode`. Writes get the §8.2 READ_ONLY error. Approval over MCP is deferred (§13).
+- **Tools:** `run_sql(query)` and `run_pyspark(code)`, with the names and descriptions of the §8.1 stubs. A result is the same text as the middleware's; an error sets `isError`. `run_id` is a fresh uuid (MCP has no tool-call id).
+- **One sandbox per server process,** on both transports: `agent_id` is `mcp`, `session_id` a uuid made at startup. MCP 2026-07-28 has no sessions over HTTP, and clients send no conversation id, so there is nothing finer to key on. Every client of one HTTP server shares its sandbox; run another server for another sandbox. The server keeps the sandbox's `created_at` in memory for the recreation notice.
+- **Instructions:** the §8.4 agent instructions for READ_ONLY, plus one line: files under `/catalog` and `/results` are the resources below.
+- **Resources** (read-only, path = the agent-visible path under `dbrix://`): `dbrix://catalog/{path}` (`_catalog/`; reading builds the sandbox), `dbrix://results/{path}` (`_results/`), `dbrix://skills/{path}` (the packaged skills). The SDK rejects `..`, absolute paths, and NUL bytes. The server also resolves the path and refuses one outside its root, because the untrusted executor can leave symlinks in `_results/` (§7).
+- **Progress:** while the sandbox builds, the tool sends one progress notification (a no-op when the client asked for none).
+- **HTTP:** Streamable HTTP on `[mcp] host:port`, path `/mcp`. Every request needs `Authorization: Bearer <[mcp] token>` (constant-time compare), else 401; the server refuses to start over HTTP without a token. On localhost the SDK's DNS-rebinding check applies. TLS is the deployer's job (reverse proxy or load balancer).
+- **Containment:** a remote server keeps `prod_catalog` off the client's machine. A local stdio server does not contain a client that has its own shell and file tools (Claude Code reads files directly); deny those paths in the client's settings, or use a remote server.
+
+Checked against `mcp` 2.3.0.
 
 ---
 
@@ -788,6 +806,11 @@ result_file_max_rows = 10000
 
 [lifecycle]
 ttl_seconds = 86400
+
+[mcp]
+host  = "127.0.0.1"
+port  = 8765
+# token = "..."   # required for --transport http
 ```
 
 ---
@@ -806,6 +829,7 @@ ttl_seconds = 86400
 - Rewriter: every row of the §6.1 table. 3-part names round-trip. Reverse mapping removes every sandbox name and path from errors, stdout, and metadata output (§6.5), and leaves normal data rows unchanged.
 - Run log: a repeated `run_id` is written once.
 - GC: fake-clock tests for TTL, `active_run` skip, stale `active_run`, corrupt meta, and leftover `.creating-*` dirs.
+- MCP server (in-process client, fake manager): tools carry the stubs' names and descriptions; a read returns the preview; a write gets the READ_ONLY error with `isError`; the recreation notice; resources resolve, and `..` and a symlink out of the root are refused; HTTP without the token gets 401; no token, no HTTP start.
 
 ### 11.2 Integration (Docker)
 - Deep Agent end to end with a scripted model: lazy sandbox creation, `run_sql`, `run_pyspark`, preview, `/results` file readable with `read_file`, and `/catalog` readable but not writable.
@@ -821,6 +845,7 @@ ttl_seconds = 86400
 - A timeout kills and restarts the container, and the next run succeeds.
 - Agent `print` output never breaks the protocol.
 - The same middleware works with plain `create_agent`.
+- MCP server over stdio (a subprocess): `run_sql` returns a preview and `dbrix://catalog/README.md` is readable.
 
 ### 11.3 Red team (must all fail to touch prod or escape)
 `getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `df.write.saveAsTable(…, path="/x")`, `df.write.options(**{"path": "/x"})`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
@@ -853,7 +878,7 @@ For each case: the policy should block it (this is the feedback layer). Separate
 ## 13. Deferred to later versions
 
 - **DuckDB engine** (lighter and faster than Spark; needs Spark→DuckDB transpilation and a Delta write-back strategy).
-- **MCP server** for off-the-shelf clients (Claude Code, Claude Desktop).
+- Writes over MCP (approval via elicitation), and more than one sandbox per MCP server.
 - **CLI** (`dbrix generate / sandbox / gc`).
 - **Claude Agent SDK adapter** and a framework-agnostic `@sandboxed` decorator.
 - **Messy nested-JSON Bronze** with `json_foreign_keys` JSONPath extraction.
@@ -942,3 +967,10 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 66 | Enforcement test | inspect graph nodes | Check subagent specs before building; reject compiled subagents that have a code tool |
 | 67 | READ_ONLY and dynamic SQL | — | Static writes: error before running. Dynamic SQL only: runs with `allow_writes=false` |
 | 68 | PySpark's error log | printed to stderr | Disabled in the runtime: it repeated every Spark error with the JVM stack trace and container paths (§6.5) |
+| 69 | MCP server | deferred | Built, READ_ONLY only (§8.5). Writes over MCP stay deferred |
+| 70 | Shared core | — | `dbrix.calls.answer` runs one call for both front doors; approval is a callback (`interrupt` or none). No agent framework in it |
+| 71 | MCP sandbox identity | per MCP session | Per server process: MCP 2026-07-28 has no HTTP sessions and clients send no conversation id |
+| 72 | MCP files | — | Resources whose URI is the agent-visible path under `dbrix://`; the symlink check mirrors Deep Agents' `FilesystemBackend` |
+| 73 | MCP transports and auth | — | stdio and Streamable HTTP in one server; HTTP needs a bearer token from `dbrix.toml`. No OAuth |
+| 74 | `read_file` in agent text | named | Removed from the instructions and results: the tool's name depends on the client |
+| 75 | MCP dependency | — | `mcp` joins the host-only `agents` group; the server reuses the §8.1 stubs' names and descriptions |
