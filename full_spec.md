@@ -106,7 +106,7 @@ dbrix-harness/
 │   ├── rewrite/       # Phase 4: name rewrite + reverse mapping (used in containers)
 │   ├── executor/      # client.py (host), runtime/ (in container)
 │   ├── lifecycle/     # Phase 5: manager.py, meta.py, runlog.py, gc.py, locks.py
-│   ├── catalog_docs/  # generates /catalog markdown, AGENTS.md
+│   ├── catalog_docs/  # /catalog markdown (written by the sampler job), the agent instructions
 │   ├── middleware/    # DbrixSandboxMiddleware, tools.py (fail-closed stubs)
 │   ├── deepagents.py  # create_sandboxed_deep_agent(...)
 │   └── skills/databricks-analyst/SKILL.md
@@ -607,7 +607,8 @@ DbrixSandboxMiddleware(
 - **Errors as feedback:** policy violations and runtime errors become a `ToolMessage` with `status="error"` and a hint, so the agent can correct itself. They are never raised into the graph. (Host configuration errors, such as `InvalidSandboxIdError`, are raised.)
 - **Lazy creation:** the first intercepted call creates the sandbox (sampling plus container start, roughly 15–30 s). The middleware streams a progress custom event so UIs can show it.
 - **Recreation notice:** the middleware keeps `dbrix_sandbox_created_at` in agent state (middleware `state_schema`). If the sandbox's `created_at` no longer matches (it was GC'd and rebuilt), the `ToolMessage` starts with: "Note: your sandbox expired and was recreated from the same starting data. Tables you created or changed earlier are gone." The state is then updated.
-- Exact hook signatures, `state_schema`, and how a tool call returns a state update must be checked against the current LangChain v1 docs when implementing.
+- Checked against LangChain 1.4.7: `wrap_tool_call(request, handler)` / `awrap_tool_call` return a `ToolMessage` or a `Command`; the state update is a `Command(update={"messages": [...], "dbrix_sandbox_created_at": ...})`. `session_id` comes from `request.runtime.config["configurable"]["thread_id"]`; the progress event goes through `get_stream_writer()`.
+- In READ_ONLY, code with static writes is answered with an error (`rule_id` `READ_ONLY_WRITE`, logged as `POLICY_BLOCKED`); dynamic SQL alone runs with `allow_writes=false`, so the runtime wrapper blocks it if it writes.
 
 ### 8.3 Human approval for writes (READ_WRITE)
 
@@ -628,7 +629,7 @@ DbrixSandboxMiddleware(
 2. `run_id` is the LangChain `tool_call_id`. The run log skips a `run_id` it has already written, so a repeated step never logs twice.
 3. The approved code runs after `interrupt()` returns, so it runs once per decision.
 4. Accepted gap: if the host crashes after an approved write ran but before the checkpoint was saved, the write may run again on resume. The sandbox is disposable, so this is accepted.
-5. To check when implementing: whether LangChain v1 runs each tool call of a step as a separate task (then only the interrupted call repeats). If not, other read calls in the same step repeat too; that is harmless, and rule 2 keeps the log clean.
+5. Checked: LangChain 1.4.7 runs each tool call of a step as a separate task (`Send` per call), so only the interrupted call repeats.
 
 ### 8.4 `create_sandboxed_deep_agent(...)`
 
@@ -642,6 +643,7 @@ agent = create_sandboxed_deep_agent(
     sampling=SamplingConfig(sample_size=5),   # passed to the SandboxManager
     subagents=[...],          # optional extra subagents; middleware injected automatically
     extra_tools=[...],        # non-code tools only
+    # also: config (default dbrix.toml), docker (default from_env()), checkpointer
 )
 agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": "s1"}})
 ```
@@ -652,21 +654,21 @@ It configures:
 |---|---|
 | `tools=` | `run_sql`, `run_pyspark`, plus `extra_tools` |
 | `middleware=` | `DbrixSandboxMiddleware(...)` |
-| **Backend** | `CompositeBackend`: `/catalog/` → `FilesystemBackend` over generated catalog docs; `/results/` → `FilesystemBackend` over the session's `_results/`; `/` → `StateBackend` (agent scratch and notes) |
-| **`permissions=`** | Deny `write` on `/catalog/**` and `/results/**`, so the agent can read them but not change them |
-| **Excluded tools** | Remove `execute` (sandbox shell) and `eval` (JS interpreter) via a `HarnessProfile(excluded_tools=…)`. No sandbox backend is ever configured. Our two tools are the only code-execution path |
-| **Subagents** | Built-in **`explorer`**: profiles tables and returns findings, and gets the same tools with a middleware instance forced to READ_ONLY. Each user-supplied subagent has `DbrixSandboxMiddleware` **injected** into its `middleware` list. The general-purpose subagent gets it too |
-| **`memory=`** | A generated `AGENTS.md`: what the catalog is, the 3-part naming rule, the medallion layers, how to use the tools, the current mode, and that writes need approval |
-| **Skills** | `databricks-analyst` SKILL.md: Spark SQL vs PySpark patterns, common joins in this domain, reading `/results`, and handling policy errors |
+| **Backend** | `CompositeBackend`: `/catalog/` and `/results/` → `SandboxFiles`, a read-only backend that finds the current thread's sandbox on each call (Deep Agents 0.7 takes only fixed backend objects, and the agent serves every thread) and reads its `_catalog/` or `_results/`; reading builds the sandbox when it doesn't exist yet. `/skills/` → `FilesystemBackend` over the packaged skills. `/` → `StateBackend` (agent scratch and notes) |
+| **`permissions=`** | Deny `write` on `/catalog/**`, `/results/**`, and `/skills/**`, so the agent can read them but not change them |
+| **Excluded tools** | No sandbox backend is ever configured, so Deep Agents hides `execute` itself (it drops tools the backend can't serve). No `HarnessProfile`: it is registered per process and model, not per agent. Deep Agents 0.7 has no `eval` tool. A test checks that neither appears. Our two tools are the only code-execution path |
+| **Subagents** | Built-in **`explorer`**: profiles tables and returns findings, and gets the same tools with a middleware instance forced to READ_ONLY. Each user-supplied subagent has `DbrixSandboxMiddleware` **injected** into its `middleware` list. Deep Agents' default general-purpose subagent would not inherit our middleware, so the factory passes its own `general-purpose` (Deep Agents' `GENERAL_PURPOSE_SUBAGENT` plus the main tools and the middleware), which replaces the default |
+| **`system_prompt=`** | The generated agent instructions (the planned `AGENTS.md`): what the catalog is, the 3-part naming rule, the medallion layers, how to use the tools, the current mode, and that writes need approval. Passed as the system prompt, not `memory=`: no file or route, and the agent can't edit it |
+| **Skills** | `databricks-analyst` SKILL.md (`skills=["/skills/"]`): Spark SQL vs PySpark patterns, common joins in this domain, reading `/results`, and handling policy errors |
 | Checkpointer | `InMemorySaver` unless one is supplied |
 
-**`/catalog/` contents** are generated once, when the sandbox is created, from the manifest and sandbox metadata, always using prod-facing names: `README.md` (schema overview, ER diagram as text, and the sampling limitation from §4.2), and `<schema>/<table>.md` (description, columns with types and descriptions, PK, FKs, sandbox row count, five sample rows). Tables the agent creates later are not in `/catalog`; the agent can `DESCRIBE` them.
+**`/catalog/` contents** are generated once, when the sandbox is created, by the sampler job at its end (Spark is running and the selected rows are in memory), into `<sandbox>/_catalog/`, always using prod-facing names: `README.md` (schema overview, ER diagram as text, and the sampling limitation from §4.2), and `<schema>/<table>.md` (description, columns with types and descriptions, PK, FKs, sandbox row count, five sample rows). Tables the agent creates later are not in `/catalog`; the agent can `DESCRIBE` them.
 
-**Enforcement test:** after building the agent, the factory checks every graph node (main agent and all subagents) that exposes a tool in `tool_map`. Each must have `DbrixSandboxMiddleware`, otherwise the factory raises `MisconfiguredSandboxError`. The fail-closed stubs (§8.1) are the second line of defense.
+**Enforcement test:** before building the agent, the factory checks every subagent that can call a tool in `tool_map` (a spec without `tools` gets the main agent's). Each must have `DbrixSandboxMiddleware`, otherwise the factory raises `MisconfiguredSandboxError`. A compiled subagent (`CompiledSubAgent`) can't be given the middleware, so one whose graph has a code tool is rejected. The main agent gets it by construction. The fail-closed stubs (§8.1) are the second line of defense.
 
 The same middleware also works with plain `langchain.agents.create_agent` (see `examples/langchain_agent_demo.py`). The backend, memory, skill, and subagent features are Deep Agents-only.
 
-Exact Deep Agents parameter names (`HarnessProfile`, `permissions` rule shape, skills parameter, subagent `middleware` field) must be checked against the installed version when implementing.
+Checked against Deep Agents 0.7.32. The agent libraries (`langchain`, `langgraph`, `deepagents`) are a host-only dependency group (`agents`); the `dbrix-spark` image installs no default group (§6.3).
 
 ---
 
@@ -929,3 +931,12 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 56 | Foreign containers | — | A container this host process did not start is removed and started fresh |
 | 57 | GC and busy sandboxes | take the lock | Never wait: skip a busy sandbox, and check expiry again under the lock |
 | 58 | Container limit across processes | label count | Count, evict, and start under one global lock; evict = stop the LRU container whose sandbox lock is free |
+| 59 | Phase 5 scope | §9 | §9 plus all of §8 (middleware, approval, factory, docs, skill). There is no Phase 6 |
+| 60 | Agent libraries | dependencies | Host-only dependency group `agents`; the Spark image (which runs untrusted code) does not install them |
+| 61 | Removing `execute` / `eval` | `HarnessProfile(excluded_tools)` | Nothing to configure: Deep Agents hides `execute` without a shell backend, and has no `eval`. A profile would apply to the whole process. A test checks both are absent |
+| 62 | General-purpose subagent | middleware injected | Our own `general-purpose` spec replaces the default, which would not inherit the middleware |
+| 63 | Per-thread `/catalog` and `/results` | `FilesystemBackend` per route | `SandboxFiles`: a read-only backend that looks up the thread's sandbox per call. Reading builds the sandbox |
+| 64 | Catalog docs and sample rows | at creation | Written by the sampler job into `_catalog/`; sample rows from the selected rows in memory |
+| 65 | `AGENTS.md` | `memory=` | Generated text passed as the system prompt |
+| 66 | Enforcement test | inspect graph nodes | Check subagent specs before building; reject compiled subagents that have a code tool |
+| 67 | READ_ONLY and dynamic SQL | — | Static writes: error before running. Dynamic SQL only: runs with `allow_writes=false` |
