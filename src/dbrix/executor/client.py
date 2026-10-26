@@ -84,24 +84,48 @@ def start_executor(
         labels={SANDBOX_LABEL: sandbox_id},
         **NO_NETWORK,
     )
-    # Attach before starting, so no line is lost (§6.3).
-    sock = client.api.attach_socket(str(container.id), params={"stdin": 1, "stdout": 1, "stream": 1})
-    executor = Executor(container, getattr(sock, "_sock", sock))
-    container.start()
-    try:
-        ready = json.loads(_read_line(executor, EXECUTOR_START_TIMEOUT))
-    except ExecutorError as e:
-        logs = container.logs(stdout=False, stderr=True, tail=20).decode(errors="replace")
-        raise ExecutorError(f"executor did not start: {e}\n{logs}") from e
-    if ready != {"ready": True}:
-        raise ExecutorError(f"unexpected first line from the executor: {ready!r}")
+    executor = Executor(container, _attach(client, container))
+    _wait_ready(executor)
     return executor
 
 
+def restart_executor(client: docker.DockerClient, executor: Executor) -> None:
+    """Start the stopped container again (§6.3). Tables survive in the metastore; temp views do not."""
+    executor.sock.close()
+    executor.container.stop(timeout=0)  # no-op when already stopped
+    executor.sock, executor.pending = _attach(client, executor.container), b""
+    _wait_ready(executor)
+
+
+def _attach(client: docker.DockerClient, container: Container) -> socket.socket:
+    """Attach, then start, so no line is lost (§6.3)."""
+    sock = client.api.attach_socket(str(container.id), params={"stdin": 1, "stdout": 1, "stream": 1})
+    container.start()
+    raw: socket.socket = getattr(sock, "_sock", sock)
+    return raw
+
+
+def _wait_ready(executor: Executor) -> None:
+    try:
+        ready = json.loads(_read_line(executor, EXECUTOR_START_TIMEOUT))
+    except ExecutorError as e:
+        logs = executor.container.logs(stdout=False, stderr=True, tail=20).decode(errors="replace")
+        raise ExecutorError(f"executor did not start: {e}\n{logs}") from e
+    if ready != {"ready": True}:
+        raise ExecutorError(f"unexpected first line from the executor: {ready!r}")
+
+
 def run(executor: Executor, request: RunRequest, timeout: float) -> RunResult:
-    """Send one request; raises ExecutorTimeout when no answer comes within `timeout` seconds."""
+    """Send one request. When no answer comes within `timeout` seconds (ExecutorTimeout) or the answer is broken
+    (ExecutorError), the container is stopped: its output can't be trusted to line up any more. The caller
+    restarts it with `restart_executor`."""
     executor.sock.sendall(request.model_dump_json().encode() + b"\n")
-    result = RunResult.model_validate_json(_read_line(executor, timeout))
+    try:
+        line = _read_line(executor, timeout)
+    except ExecutorError:
+        executor.container.stop(timeout=0)
+        raise
+    result = RunResult.model_validate_json(line)
     if result.full_result_path not in (None, f"{RESULTS_PATH}/{request.run_id}.csv"):
         raise ExecutorError(f"unexpected result path from the executor: {result.full_result_path!r}")
     return result

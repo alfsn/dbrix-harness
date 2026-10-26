@@ -7,7 +7,7 @@ import docker
 import pytest
 
 from dbrix.config import RESULTS_DIR
-from dbrix.executor.client import Executor, run, start_executor
+from dbrix.executor.client import Executor, ExecutorTimeout, restart_executor, run, start_executor
 from dbrix.executor.protocol import RunRequest, RunResult
 from dbrix.policy.report import Language
 from dbrix.sampler import SampleResult
@@ -31,10 +31,15 @@ def executor(client: docker.DockerClient, sandbox: Path) -> Iterator[Executor]:
 
 
 def call(
-    executor: Executor, language: Language, code: str, run_id: str = "r1", allow_writes: bool = False
+    executor: Executor,
+    language: Language,
+    code: str,
+    run_id: str = "r1",
+    allow_writes: bool = False,
+    timeout: float = CONFIG.executor.run_timeout,
 ) -> RunResult:
     request = RunRequest(run_id=run_id, language=language, code=code, allow_writes=allow_writes)
-    return run(executor, request, CONFIG.executor.run_timeout)
+    return run(executor, request, timeout)
 
 
 def blocked_rule(r: RunResult) -> str | None:
@@ -158,6 +163,26 @@ def test_temp_views_across_calls(executor: Executor) -> None:
     assert call(executor, "sql", "SELECT * FROM v").ok
     assert call(executor, "pyspark", 'spark.table("v")').ok
     assert call(executor, "sql", "DROP VIEW v").ok
+
+
+# Timeout and restart (§6.3)
+
+
+def test_timeout_restarts_and_tables_survive(client: docker.DockerClient, executor: Executor) -> None:
+    for sql in [
+        "CREATE TABLE prod_catalog.gold.kept AS SELECT 1 AS x",
+        "CREATE TABLE prod_catalog.gold.dropped AS SELECT 1 AS x",
+        "DROP TABLE prod_catalog.gold.dropped",
+    ]:
+        assert call(executor, "sql", sql, allow_writes=True).ok
+    assert call(executor, "sql", "CREATE TEMP VIEW tv AS SELECT 1 AS x").ok
+    with pytest.raises(ExecutorTimeout):
+        call(executor, "pyspark", "import time\ntime.sleep(600)", timeout=2)
+    restart_executor(client, executor)
+    assert call(executor, "sql", "SELECT * FROM prod_catalog.gold.kept").row_count == 1
+    r = call(executor, "sql", "SELECT * FROM prod_catalog.gold.dropped")
+    assert r.error and "`prod_catalog`.`gold`.`dropped`" in r.error.message
+    assert blocked_rule(call(executor, "sql", "SELECT * FROM tv")) == "TABLE_NAME_NOT_ALLOWED"  # temp views are lost
 
 
 # Keeping the illusion (§6.5)
