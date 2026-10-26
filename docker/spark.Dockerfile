@@ -11,7 +11,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy PATH=/opt/venv/bin:$PATH
 
 WORKDIR /opt/dbrix
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-default-groups --no-install-project
 
 # Resolve the Delta jars for the installed delta-spark once, at build time, into /opt/ivy/jars.
 # At runtime spark.jars points there (dbrix.config.DELTA_JARS), so nothing is downloaded.
@@ -20,7 +20,7 @@ c(S.builder.master('local[1]').config('spark.jars.ivy', '/opt/ivy')).getOrCreate
     && chmod -R a+rX /opt/ivy
 
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable
+RUN uv sync --frozen --no-default-groups --no-editable
 
 # Hadoop needs a named user; every container runs as this one (§7).
 USER 10001:10001

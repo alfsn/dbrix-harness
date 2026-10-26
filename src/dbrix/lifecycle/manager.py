@@ -5,6 +5,7 @@ The host keeps one `Executor` handle per sandbox it started. Everything shared b
 
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,14 @@ from dbrix.sampler import run_sampler
 LOST_STATE = "Temp views and cached data are lost; tables are kept."
 
 
+# Called with the sandbox id when a build starts, so a UI can show progress (§8.2).
+OnBuild = Callable[[str], None]
+
+
+def _quiet(sandbox_id: str) -> None:
+    pass
+
+
 class ExecutorBusy(Exception):
     """Every executor slot stayed busy for `run_timeout` seconds."""
 
@@ -51,17 +60,17 @@ class Sandbox:
 
 class SandboxManager:
     def __init__(self, cfg: Config, docker: DockerClient) -> None:
-        self._cfg = cfg
+        self.cfg = cfg
         self._docker = docker
         self._root = cfg.sandbox_root
         self._catalog = load_manifest(cfg.manifest).catalog
         self._executors: dict[str, Executor] = {}
 
-    def get_or_create(self, agent_id: str, session_id: str) -> Sandbox:
+    def get_or_create(self, agent_id: str, session_id: str, on_build: OnBuild = _quiet) -> Sandbox:
         """Build the sandbox on first use. Two callers at once build it once."""
         sid = sandbox_id(agent_id, session_id)
         with lock(self._root, sid):
-            return self._ensure(agent_id, session_id, sid)
+            return self._ensure(agent_id, session_id, sid, on_build)
 
     def run(
         self,
@@ -70,11 +79,12 @@ class SandboxManager:
         tool: str,
         mode: OperatingMode,
         approval: Approval | None = None,
+        on_build: OnBuild = _quiet,
     ) -> tuple[Sandbox, RunResult]:
         """Run one request and log it. Runs on one sandbox wait for each other. The sandbox is rebuilt when GC
         removed it since `get_or_create`; the returned Sandbox is the one the code ran on. Raises ExecutorBusy."""
         with lock(self._root, sandbox.id):
-            sandbox = self._ensure(sandbox.agent_id, sandbox.session_id, sandbox.id)
+            sandbox = self._ensure(sandbox.agent_id, sandbox.session_id, sandbox.id, on_build)
             executor = self._executor(sandbox)
             started = now()
             meta = read_meta(sandbox.dir)
@@ -106,11 +116,12 @@ class SandboxManager:
             if sandbox.dir.exists():
                 self._record(sandbox.dir, record, ran=False)
 
-    def _ensure(self, agent_id: str, session_id: str, sid: str) -> Sandbox:
+    def _ensure(self, agent_id: str, session_id: str, sid: str, on_build: OnBuild) -> Sandbox:
         """Under the sandbox lock: the sandbox, built in `.creating-<id>` and renamed when missing (§9.5)."""
         final = self._root / sid
         if not final.exists():
             creating = self._root / f"{CREATING_PREFIX}{sid}"
+            on_build(sid)
             shutil.rmtree(creating, ignore_errors=True)  # left from a crash or a failed build
             creating.mkdir(parents=True)
             t = now()
@@ -125,13 +136,13 @@ class SandboxManager:
             try:
                 sample = run_sampler(
                     self._docker,
-                    self._cfg.executor.image,
-                    self._cfg.prod_catalog_dir,
+                    self.cfg.executor.image,
+                    self.cfg.prod_catalog_dir,
                     creating,
-                    self._cfg.manifest,
+                    self.cfg.manifest,
                     agent_id,
                     session_id,
-                    self._cfg.sampling,
+                    self.cfg.sampling,
                 )
             except Exception as e:
                 write_meta(creating, meta.model_copy(update={"status": "FAILED", "last_error": str(e)}))
@@ -153,7 +164,7 @@ class SandboxManager:
                 return executor
         else:
             remove_executors(self._docker, sandbox.id)  # one we can't attach to without losing lines
-        deadline = time.monotonic() + self._cfg.executor.run_timeout
+        deadline = time.monotonic() + self.cfg.executor.run_timeout
         while True:
             # Count, evict, and start as one step across host processes.
             with lock(self._root, EXECUTORS_LOCK):
@@ -163,11 +174,11 @@ class SandboxManager:
                     else:
                         executor = start_executor(
                             self._docker,
-                            self._cfg.executor.image,
+                            self.cfg.executor.image,
                             sandbox.dir,
                             sandbox.id,
                             self._catalog,
-                            self._cfg.executor,
+                            self.cfg.executor,
                         )
                     break
             if time.monotonic() > deadline:
@@ -182,7 +193,7 @@ class SandboxManager:
         one whose sandbox is not running a run (its lock is free)."""
         running = self._docker.containers.list(filters={"label": SANDBOX_LABEL, "status": "running"})
         others = [c.labels[SANDBOX_LABEL] for c in running if c.labels[SANDBOX_LABEL] != sid]
-        if len(others) < self._cfg.executor.max_containers:
+        if len(others) < self.cfg.executor.max_containers:
             return True
         for other in sorted(others, key=self._last_used):
             try:
@@ -202,7 +213,7 @@ class SandboxManager:
 
     def _call(self, executor: Executor, request: RunRequest) -> tuple[RunResult, Outcome]:
         """Send the request. A timeout or a broken answer leaves the container stopped; the next run restarts it."""
-        timeout = self._cfg.executor.run_timeout
+        timeout = self.cfg.executor.run_timeout
         start = time.monotonic()
         try:
             result = run_executor(executor, request, timeout)

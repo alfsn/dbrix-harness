@@ -1,10 +1,13 @@
-"""Spark in dbrix-spark containers: the session (Delta plus a Derby metastore in the catalog dir) and the
-catalog steps shared by the generator and the sampler."""
+"""Spark in dbrix-spark containers: the session (Delta plus a Derby metastore in the catalog dir), the catalog
+steps shared by the generator and the sampler, and how rows are shown as CSV or markdown."""
 
+from collections.abc import Iterable, Sequence
 from glob import glob
+from typing import Any
 
-from pyspark.sql import Column, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 from dbrix.config import DELTA_JARS, METASTORE_DIR, SPARK_DRIVER_MEMORY, SPARK_SHUFFLE_PARTITIONS
 from dbrix.manifest import Manifest
@@ -60,3 +63,27 @@ def write_gold(spark: SparkSession, manifest: Manifest) -> None:
             sql = rewrite_sql(t.transform, manifest.catalog, lambda _: False)
             spark.sql(sql).write.format("delta").saveAsTable(name)
             print(f"computed {name}", flush=True)
+
+
+def flatten(df: DataFrame) -> DataFrame:
+    """Struct, array, and map columns as JSON strings, binary columns as base64: values a CSV or markdown cell can
+    hold (§6.4)."""
+    return df.select(
+        [
+            F.to_json(f.name).alias(f.name)
+            if isinstance(f.dataType, (T.StructType, T.ArrayType, T.MapType))
+            else F.base64(f.name).alias(f.name)
+            if isinstance(f.dataType, T.BinaryType)
+            else F.col(f.name)
+            for f in df.schema.fields
+        ]
+    )
+
+
+def _cell(value: Any) -> str:
+    return "null" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def markdown_table(columns: list[str], rows: Iterable[Sequence[Any]]) -> str:
+    lines = ["| " + " | ".join(columns) + " |", "|" + " --- |" * len(columns)]
+    return "\n".join(lines + ["| " + " | ".join(map(_cell, row)) + " |" for row in rows])

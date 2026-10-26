@@ -35,6 +35,9 @@ METASTORE_DIR = "_metastore"
 CATALOG_META_FILE = "_catalog_meta.json"
 RESULTS_DIR = "_results"  # in a sandbox dir; the agent sees it as RESULTS_PATH (§8.4)
 RESULTS_PATH = "/results"
+CATALOG_DOCS_DIR = "_catalog"  # in a sandbox dir; the agent sees it as CATALOG_PATH (§8.4)
+CATALOG_PATH = "/catalog"
+SAMPLE_ROWS = 5  # per table in the catalog docs
 
 # Sandbox root layout (§4.3, §9).
 SANDBOX_META_FILE = "_sandbox_meta.json"

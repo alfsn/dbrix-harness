@@ -23,7 +23,7 @@ from dbrix.executor.runtime.wrap import RunState, install
 from dbrix.policy import SandboxSecurityException
 from dbrix.policy.sql import split_statements
 from dbrix.rewrite import reverse_map
-from dbrix.spark import create_session
+from dbrix.spark import create_session, flatten, markdown_table
 
 AGENT_FILE = "<agent>"  # the file name agent code is compiled with, so tracebacks show only its frames
 
@@ -56,24 +56,10 @@ def run_pyspark(spark: SparkSession, code: str) -> DataFrame | None:
 RUNNERS = {"sql": run_sql, "pyspark": run_pyspark}
 
 
-def _cell(value: Any) -> str:
-    return "null" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
-
-
 def save_result(df: DataFrame, path: Path, preview_rows: int, max_rows: int) -> tuple[str, int | None, bool]:
     """Write up to `max_rows` rows as CSV (§6.4). Returns the markdown preview, the row count (None when cut off),
     and whether rows were cut off. Collects once: `max_rows + 1` rows tell whether there are more."""
-    flat = df.select(
-        [
-            F.to_json(f.name).alias(f.name)
-            if isinstance(f.dataType, (T.StructType, T.ArrayType, T.MapType))
-            else F.base64(f.name).alias(f.name)
-            if isinstance(f.dataType, T.BinaryType)
-            else F.col(f.name)
-            for f in df.schema.fields
-        ]
-    )
-    rows = flat.limit(max_rows + 1).collect()
+    rows = flatten(df).limit(max_rows + 1).collect()
     truncated = len(rows) > max_rows
     rows = rows[:max_rows]
     path.parent.mkdir(exist_ok=True)
@@ -81,9 +67,7 @@ def save_result(df: DataFrame, path: Path, preview_rows: int, max_rows: int) -> 
         writer = csv.writer(f)
         writer.writerow(df.columns)
         writer.writerows(rows)
-    lines = ["| " + " | ".join(df.columns) + " |", "|" + " --- |" * len(df.columns)]
-    lines += ["| " + " | ".join(map(_cell, row)) + " |" for row in rows[:preview_rows]]
-    return "\n".join(lines), None if truncated else len(rows), truncated
+    return markdown_table(df.columns, rows[:preview_rows]), None if truncated else len(rows), truncated
 
 
 def _error(e: Exception, catalog: str) -> AgentError:

@@ -13,6 +13,11 @@ dependencies = [
 ]
 
 [dependency-groups]
+agents = [
+    "deepagents>=0.7.32",
+    "langchain>=1.4.7",
+    "langgraph>=1.2.17",
+]
 dev = [
     "mypy>=1.15.0",
     "pytest>=9.1.1",
@@ -20,6 +25,10 @@ dev = [
     "types-docker>=7.1.0",
     "types-pyyaml>=6.0.12",
 ]
+
+[tool.uv]
+# The agent libraries run on the host only; the dbrix-spark image installs no default group (§6.3).
+default-groups = ["dev", "agents"]
 
 [build-system]
 requires = ["hatchling"]

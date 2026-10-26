@@ -2,7 +2,7 @@
 
     python -m dbrix.sampler.sample <manifest> <agent_id> <session_id> <SamplingConfig json>
 
-The last stdout line is `{"seed": ..., "row_counts": {...}}`. Every random choice is a hash of
+The last stdout line is `{"seed": ..., "row_counts": {...}}`. The catalog docs (§8.4) go to `/sandbox/_catalog/`. Every random choice is a hash of
 (seed, table, salt, primary key), never rand(), so the sandbox does not depend on partitioning.
 """
 
@@ -16,10 +16,11 @@ from pathlib import Path
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
-from dbrix.config import PROD_CATALOG_MOUNT, SANDBOX_MOUNT, SamplingConfig
+from dbrix.catalog_docs import TableSample, write_docs
+from dbrix.config import CATALOG_DOCS_DIR, PROD_CATALOG_MOUNT, SAMPLE_ROWS, SANDBOX_MOUNT, SamplingConfig
 from dbrix.integrity import check_integrity, fk_keys
 from dbrix.manifest import Anchor, ForeignKey, Manifest, anchor_of, load_manifest
-from dbrix.spark import create_schemas, create_session, table_path, unit, write_gold
+from dbrix.spark import create_schemas, create_session, flatten, markdown_table, table_path, unit, write_gold
 
 
 def is_null(fk: ForeignKey) -> Column:
@@ -133,6 +134,16 @@ def main(manifest_path: Path, agent_id: str, session_id: str, sampling: Sampling
     tables = {n: spark.table(n) for n in manifest.tables}
     check_integrity(tables, manifest)
     row_counts = {n: df.count() for n, df in tables.items()}
+    # Sample rows from the selected rows already in memory: no second read of the Delta tables.
+    samples = {
+        n: TableSample(
+            columns=[(f.name, f.dataType.simpleString()) for f in df.schema.fields],
+            row_count=row_counts[n],
+            sample_markdown=markdown_table(df.columns, flatten(selected.get(n, df)).limit(SAMPLE_ROWS).collect()),
+        )
+        for n, df in tables.items()
+    }
+    write_docs(Path(SANDBOX_MOUNT, CATALOG_DOCS_DIR), manifest, samples)
     spark.stop()
     print(json.dumps({"seed": seed, "row_counts": row_counts}), flush=True)
 
