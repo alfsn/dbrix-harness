@@ -507,7 +507,7 @@ There is one engine, **local PySpark 4.2 with delta-spark**, and two tools:
   - `run_id` must match `[A-Za-z0-9_-]{1,128}`, because it names the result file.
   - The host treats every response as untrusted: it validates it with pydantic and rejects lines larger than `MAX_RESPONSE_BYTES` (`config.py`).
 - **Logs:** Spark's log level is `WARN`. Python stdout and stderr are captured per run into `RunResult` (8 KB each). JVM logs go to the container's stderr and are kept by Docker (`docker logs <container>`), with no extra code.
-- **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is killed and restarted, and the run is recorded as `TIMEOUT`. Tables survive (metastore); temp views and cached data are lost.
+- **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is stopped and the run is recorded as `TIMEOUT`; the sandbox's next run restarts it. Tables survive (metastore); temp views and cached data are lost.
   - A broken answer (larger than `MAX_RESPONSE_BYTES`, or the output closed) stops the container the same way, because its output may be out of step. `restart_executor` starts the same container again on a new connection.
 - **Container limit:** at most `max_containers` (default `2`) executor containers run at once, counted by the label `dbrix.sandbox_id=<id>` across all host processes. To start a new one when the limit is reached, the client stops the least recently used container that is not running a run. Its sandbox stays on disk and its container restarts on demand.
   - If every container is busy running a run, the call **waits** for a free slot, up to `run_timeout`. If none frees up in time, the agent gets an error `ToolMessage`: "executor busy, try again". This wait does not count toward the call's own run timeout. In async code it happens in the worker thread (§8.2).
@@ -709,7 +709,7 @@ CREATING ──ok──▶ IDLE ──run──▶ ACTIVE ──success──▶
 ```
 
 - `CREATING` exists only in a `.creating-<id>` dir (§9.5). A finished sandbox starts at `IDLE`.
-- `FAILED` means the last run or creation failed. It is kept until the TTL expires so it can be debugged.
+- `FAILED` means the last run or creation failed. A run is code that reached the executor: any outcome other than `OK` (`RUNTIME_ERROR`, `TIMEOUT`, or a block by the runtime wrapper) sets `FAILED`, and the next run moves it on. Calls that never ran (`POLICY_BLOCKED` on the host, `REJECTED`) are logged and count as activity (`last_used_at`), but change neither the status nor `run_count`. A failed creation is kept until the TTL expires so it can be debugged.
 - A pending approval is not a status. It lives in the LangGraph checkpoint (§8.3).
 
 ### 9.3 `runs.jsonl` (append-only, one line per run)
@@ -722,7 +722,7 @@ The writer skips a `run_id` that is already in the file (§8.3). Policy-blocked 
 
 `dbrix.lifecycle.gc.run(sandbox_root: Path, ttl_seconds: int, run_timeout: int, docker: DockerClient, now: datetime | None = None, dry_run: bool = False) -> GcReport`, also runnable as `python -m dbrix.lifecycle.gc` (which reads `dbrix.toml` and passes the values in). It is idempotent. The README ships cron and systemd-timer examples to run it hourly.
 
-For each `sandbox_root/agent_*` directory:
+For each `sandbox_root/agent_*` directory (GC never waits for a lock: a busy sandbox is in use and skipped; under the lock, steps 1–3 are checked again):
 1. Read the meta. If it is missing or corrupt, use the directory's mtime as `last_used_at`.
 2. Skip it if `active_run` is set and its `started_at` is less than `2 × run_timeout` ago. An older `active_run` means a crashed run, which counts as idle.
 3. If `now − last_used_at > ttl_seconds` (measured from **last activity**): take the sandbox lock, stop and remove its container (by label), then delete the directory.
@@ -741,9 +741,12 @@ A sandbox can be GC'd while an approval is pending. On resume it is rebuilt from
   3. if a `.creating-<id>` dir exists, it is left from a crash: delete it;
   4. build the sandbox in `.creating-<id>` (jobs container mounts it at `/sandbox`);
   5. write the meta with status `IDLE`, then rename the dir to `agent_{…}` (a rename is atomic);
-  6. start the executor, release the lock.
+  6. release the lock. The executor is started by the first run, not here: runs are the only place a container starts (§6.3 container limit).
   If building fails, the `.creating-<id>` dir is kept with status `FAILED` and the error, the agent gets an error `ToolMessage`, and the next call starts over at step 3.
 - The jobs container and the executor never open the same Derby metastore at once, because the executor only starts after step 5.
+- A run takes the lock, then makes sure the sandbox exists (rebuilding it if GC removed it while an approval was pending) and returns the sandbox it ran on, so the middleware can compare `created_at`.
+- **Container limit:** a global lock `.locks/_executors.lock` makes "count running containers, evict, start" one step across host processes. Eviction stops (does not remove) the least recently used container (by `last_used_at`) whose sandbox lock is free. A waiting call looks again every second.
+- A host process keeps a handle only for containers it started. A container of the sandbox it has no handle for (another process, a host restart) is removed and a new one started, because attaching to a running container could lose lines. A handle whose container id differs from the meta's `container_id` (the sandbox was rebuilt) is dropped the same way.
 
 ### 9.6 Rebuilding after GC
 
@@ -920,4 +923,9 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
 | 51 | Executor `/tmp` | `rw,size=1g` | `rw,exec,nosuid,size=1g`: Docker's tmpfs default is `noexec`, and Spark's snappy/lz4/zstd load a native library they unpack into `/tmp`. No new capability: `/sandbox` already allows exec |
 | 52 | Temp view after a restart | Spark's "not found" error | Blocked as an unknown 1-part name (`TABLE_NAME_NOT_ALLOWED`): the wrapper can't tell a lost view from a wrong name |
-| 53 | Broken executor answer | — | The container is stopped, as on timeout, and restarted in place |
+| 53 | Broken executor answer | — | The container is stopped, as on timeout, and restarted in place. A closed connection or a response that fails validation counts as broken |
+| 54 | Run status | `ACTIVE → FAILED` on failure | Any run that reached the executor and did not end `OK` sets `FAILED`; `run_count` counts only those runs. Blocked and rejected calls update `last_used_at` only |
+| 55 | Executor start | at creation (§9.5 step 6) | Only in a run, so the container limit lives in one place. Creation releases the lock after the rename |
+| 56 | Foreign containers | — | A container this host process did not start is removed and started fresh |
+| 57 | GC and busy sandboxes | take the lock | Never wait: skip a busy sandbox, and check expiry again under the lock |
+| 58 | Container limit across processes | label count | Count, evict, and start under one global lock; evict = stop the LRU container whose sandbox lock is free |
