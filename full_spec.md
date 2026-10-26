@@ -20,7 +20,7 @@ The agent's code needs no changes. It believes it is talking to `prod_catalog` (
 | In v0 | Deferred (see §13) |
 |---|---|
 | One engine: **local PySpark + delta-spark** (closest to Databricks) | DuckDB engine |
-| One front door: **middleware** (LangChain v1 `AgentMiddleware`) plus the `create_sandboxed_deep_agent` factory | MCP server, CLI, Claude Agent SDK adapter, generic decorator |
+| Two front doors over one core (`dbrix.calls`): **middleware** (LangChain v1 `AgentMiddleware`) plus the `create_sandboxed_deep_agent` factory, and a READ_ONLY **MCP server** (§8.5) | CLI, Claude Agent SDK adapter, generic decorator, writes over MCP |
 | READ_ONLY and **READ_WRITE with human approval** | — |
 | Docker isolation, adversarial threat model | gVisor/nsjail |
 | Bronze / Silver / Gold, with flat key columns in Bronze | Messy nested-JSON Bronze |
@@ -76,16 +76,16 @@ Both containers use one image, `dbrix-spark`, in two roles. The host needs no JV
 ### Request flow (one tool call)
 
 1. The agent calls `run_sql(query=…)` or `run_pyspark(code=…)`.
-2. `DbrixSandboxMiddleware.wrap_tool_call` intercepts it. The real tool body never runs.
+2. A front door receives it and calls `dbrix.calls.answer`, which runs steps 3–8: `DbrixSandboxMiddleware.wrap_tool_call` (the real tool body never runs), or the MCP server's tool (§8.5).
 3. `SandboxManager.get_or_create(agent_id, session_id)`: on first use, run the sampler (jobs container) and start the executor (Phases 2 and 5). Safe to call twice (§9.5).
 4. `policy.check(code, language)` returns a `PolicyReport` (reads, writes, dynamic SQL) or raises `SandboxSecurityException` (Phase 3). It does not know the mode.
 5. The middleware applies the mode for this call:
    - READ_ONLY and the report has writes → error back to the agent.
-   - READ_WRITE and the report has writes (or dynamic SQL that may write) → **LangGraph interrupt** for human approval (§8.3).
+   - READ_WRITE and the report has writes (or dynamic SQL that may write) → the front door's `approve` callback: a **LangGraph interrupt** for human approval (§8.3).
 6. The executor client sends `{run_id, language, code, allow_writes}` to the container. `allow_writes` is true only in READ_WRITE after approval.
 7. In the container, the runtime wrapper checks and rewrites every SQL string and table name as it is used (§6.1), runs the code, and writes the full result to `/results/<run_id>.csv`.
 8. The lifecycle layer appends to `runs.jsonl` and updates `_sandbox_meta.json`.
-9. The middleware returns a `ToolMessage` with the preview, the path to the full result, and any error. All names are shown as prod names (§6.5).
+9. `answer` returns the text (preview, path to the full result, any error) and whether it is an error. The middleware wraps it in a `ToolMessage`; the MCP server in a tool result. All names are shown as prod names (§6.5).
 
 ---
 
@@ -102,13 +102,15 @@ dbrix-harness/
 │   ├── manifest/      # pydantic models, loader, validation
 │   ├── generator/     # Phase 1 (runs in jobs container)
 │   ├── sampler/       # Phase 2 (runs in jobs container)
-│   ├── policy/        # Phase 3: sql.py, python.py, report.py, exceptions.py
+│   ├── policy/        # Phase 3: sql.py, python.py, report.py, exceptions.py, spark_functions.txt
 │   ├── rewrite/       # Phase 4: name rewrite + reverse mapping (used in containers)
 │   ├── executor/      # client.py (host), runtime/ (in container)
 │   ├── lifecycle/     # Phase 5: manager.py, meta.py, runlog.py, gc.py, locks.py
-│   ├── catalog_docs/  # generates /catalog markdown, AGENTS.md
+│   ├── catalog_docs/  # /catalog markdown (written by the sampler job), the agent instructions
+│   ├── calls.py       # answer(): one tool call, steps 3–8 of §1; no agent framework
 │   ├── middleware/    # DbrixSandboxMiddleware, tools.py (fail-closed stubs)
 │   ├── deepagents.py  # create_sandboxed_deep_agent(...)
+│   ├── mcp_server/    # the MCP server (§8.5)
 │   └── skills/databricks-analyst/SKILL.md
 ├── examples/
 │   ├── deep_agent_demo.py
@@ -116,7 +118,7 @@ dbrix-harness/
 └── tests/ (unit/, integration/, redteam/)
 ```
 
-Module entry points, not a CLI product: `python -m dbrix.generator`, `python -m dbrix.lifecycle.gc`, `python -m dbrix.executor.build_image`.
+Module entry points, not a CLI product: `python -m dbrix.generator`, `python -m dbrix.lifecycle.gc`, `python -m dbrix.executor.build_image`, `python -m dbrix.mcp_server`.
 
 ---
 
@@ -236,19 +238,26 @@ Write `S[T]` for the set of selected rows of table `T`.
 
 1. **Seed:** sample `sample_size` distinct `anchor_key` values from `anchor_table` → `S[anchor]`.
 2. **Down pass (children):** walk tables in topological order. For each table `C` with an FK to a parent `P` that the down pass already reached, add to `S[C]` the rows whose FK value is in `S[P]`. If several down-pass parents reach `C`, take the **union**.
-3. **Null-FK rows:** when the down pass reaches `C` through a **nullable** FK, also add a random sample (at `unrelated_sample_fraction`) of the rows of `C` where that FK is null. These rows are part of the down pass, so their own children follow in later steps of step 2.
+3. **Null-FK rows:** for each FK through which the down pass reaches `C`, also add a random sample (at `unrelated_sample_fraction`) of the rows of `C` where that FK is null. A composite FK counts as null when any of its columns is null. Whether an FK has nulls is read from the data, not the manifest: an FK with no null rows simply adds nothing. These rows are part of the down pass, so their own children follow in later steps of step 2.
    *Example:* organic posts (`posts.campaign_id IS NULL`) are sampled here, and their `post_metrics_daily` and Bronze events follow them down.
-4. **Up pass (parents only):** repeat until nothing changes. For each selected row and each of its non-null FKs, add the referenced parent row if it is missing. **Never** expand downward from a row the up pass added into a table that steps 2–3 already reached.
+4. **Up pass (parents only):** for each selected row and each of its non-null FKs, add the referenced parent row if it is missing. **Never** expand downward from a row the up pass added into a table that steps 2–3 already reached. Done as one walk over the tables, children first (reverse topological order), checking each table's selected rows when the walk reaches it. Because the FK graph is a DAG, a parent added here can only point at tables later in the walk, so one walk gives the same result as repeating until nothing changes.
    *Example:* brand → campaigns → posts → (up) social_accounts → (up) creators. Those creators do **not** bring in their posts for other brands.
-5. **Fill unreached tables:** walk the tables that steps 2–4 did not reach, in topological order. For each, select the rows whose FK values point at rows that are **already selected** in the parent (semi-join). No up pass is needed, because those parents are already present.
-   *Example:* `raw_creator_profiles` is not reached by the down pass, because its parent `creators` only enters through the up pass. Step 5 adds the profiles of the creators already in the sandbox, instead of a random 5% of all profiles (which would pull in about 2,000 unrelated creators).
-6. **Islands:** a non-Gold table that has no selected parent at all after step 5 (or no FK at all and not reached) gets a random sample at `unrelated_sample_fraction`, followed by an up pass for those rows. The default domain has no such tables.
-7. **Gold:** do not copy. Rerun each Gold `transform` (through the rewriter) over the sampled Silver tables, so Gold always matches the sandbox.
-8. **Validate:** every non-null FK resolves and there are no duplicate PKs (shared function, §3.3). On failure, creation fails (§9.5).
+5. **Fill and islands:** walk the non-Gold tables that steps 2–4 did not reach, in topological order (parents first). For each table:
+   - **Fill**, if any of its parents has selected rows: select the rows where **every non-null FK** points at a row that is already selected, and at least one FK is non-null (semi-joins). No up pass is needed, because those parents are already present. A row with an FK pointing outside the sandbox is left out, rather than pulling in an unrelated parent.
+   - **Island**, otherwise (no FK, or no parent with selected rows): a random sample at `unrelated_sample_fraction`, followed by an up pass.
+
+   Because the walk goes parents first, an island's children are filled from the island's rows ("sample the parent, then take its children"), not sampled separately.
+   *Example (fill):* `raw_creator_profiles` is not reached by the down pass, because its parent `creators` only enters through the up pass. Step 5 adds the profiles of the creators already in the sandbox, instead of a random 5% of all profiles (which would pull in about 2,000 unrelated creators).
+   *Example (island):* a table `agencies` with no FK, and `agency_staff` with an FK to it, neither reachable from brands. `agencies` gets a 5% sample, then `agency_staff` gets all staff of those agencies. The default domain has no such tables.
+   *Example (several FKs):* `account_follows(follower_id, followed_id)`, both FKs to `social_accounts`. With accounts X and Y in the sandbox, `X→Y` is kept and `X→Z` is left out, so Z is not pulled in.
+6. **Gold:** do not copy. Rerun each Gold `transform` (through the rewriter) over the sampled Silver tables, so Gold always matches the sandbox.
+7. **Validate:** every non-null FK resolves and there are no duplicate PKs (shared function, §3.3). On failure, creation fails (§9.5).
 
 Nullable FKs with a null value are ignored by the up pass.
 
-The algorithm is implemented as Spark semi-joins over Delta tables. Sets are never collected to the driver. Prod tables are read by path (`delta.`/prod_catalog/<schema>/<table>``); this is trusted code, so the policy does not apply.
+The algorithm is implemented as Spark semi-joins over Delta tables. Sets are never collected to the driver. Every random choice (the anchor keys, null-FK rows, islands) is a hash of `(seed, table, primary key)`, never `rand()` or `DataFrame.sample()`, so the result does not depend on partitioning (same rule as §3.3). Prod tables are read by path (`delta.`/prod_catalog/<schema>/<table>``); this is trusted code, so the policy does not apply.
+
+**Scope of the sampler:** it builds into an empty directory it is given and returns the `sampling` block and `row_counts` of `_sandbox_meta.json` (§9.1). The lock, the `.creating-<id>` directory, the rename, and writing the meta file belong to the lifecycle layer (§9.5).
 
 **Known limitation (accepted):** rows added by the up pass are **incomplete**: a creator added because one of their posts was selected only has the social accounts and posts that are linked to the sampled brands. Queries such as "accounts per creator" or "posts per creator across all brands" give smaller numbers in the sandbox than in prod. The agent-facing docs (`/catalog/README.md`) state this.
 
@@ -279,6 +288,37 @@ The logical namespace is `sandbox_catalog.agent_{agent_id}_{session_id}`, used i
 - No `.` or `/` means no path injection (`../`).
 - `session_id` is the LangGraph `thread_id` (§8.2). UUIDs pass. A `thread_id` that doesn't match is a host configuration error: the middleware raises `InvalidSandboxIdError` into the graph (it is not the agent's fault, so it is not sent back as feedback).
 
+### 4.5 Speed (measured, to optimize later)
+
+**Measured** (2026-10-25, scale 1, Docker Desktop with 8 CPUs and 8 GB): one sandbox takes **about 120 s**. The §11.4 target (under 30 s, including the executor start) is **not met yet**.
+
+| Step | Time | Note |
+|---|---|---|
+| Start Spark | 6 s | |
+| Select rows (§4.2 steps 1–5) | 48 s | About 20 checkpointed queries, 1–5 s each; the first is about 10 s (JVM warm-up) |
+| Create schemas | 5 s | First use of the Derby metastore |
+| Write 10 tables | 9 s | About 1 s each |
+| Gold | 18 s | 3 transforms |
+| Integrity check (read back) | 30 s | About 25 count queries |
+| Row counts | 4 s | |
+
+**The cause is not the data** (at most about 100k rows per table). Each query spends 3–5 s in **planning** and about 1 s running. The first time a query touches a Delta table, Delta reconstructs its snapshot from `_delta_log` with extra Spark jobs. The first job of each kind also pays JVM warm-up. File access through the bind mount is not a factor: reads inside the container's own filesystem are no faster.
+
+**Tried, no gain (reverted):** running the integrity check as one Spark job (30 s → 29 s), and lazy `cache()` instead of eager `localCheckpoint()` (no change).
+
+**Proposals, in the order to try them.** Measure each one on its own and keep only what helps:
+
+1. **Delta settings for small tables.** `spark.databricks.delta.snapshotPartitions` defaults to 50, so every snapshot rebuild runs 50 tasks. Set it to 1–2. Also try `spark.sql.shuffle.partitions` at 1–2 and turning off Delta's statistics collection on write. These are config-only changes in `dbrix/spark.py`, and they help the generator and the executor too.
+2. **Check integrity before writing.** Run the check on the selected DataFrames, which are already in memory, instead of reading the tables back from Delta. Gold can likewise be computed from temp views over the selected DataFrames, then written. This avoids a second Delta snapshot per table.
+3. **Fewer prod table touches.** Read each prod table once and reuse the DataFrame. Avoid scanning a large table twice in the down pass (semi-join plus the null-FK sample).
+4. **Fewer up-pass checkpoints.** The up pass makes a new checkpointed copy of the parent table for every FK of every selected table, even when it can add nothing. For example, `posts → campaigns`: every non-null `campaign_id` already came from `S[campaigns]` in the down pass. After each island, the whole walk runs again. Skip the FK the down pass came through, and after an island walk only from that island's parents.
+5. **Overlap startup with sampling.** Start the executor container's JVM while the sampler runs, and open the metastore only after the sampler finishes (§9.5). This hides about 6 s.
+6. **Move table registration to the executor.** The sampler writes Delta by path with no metastore, and the executor registers the manifest's tables once (`CREATE TABLE … USING DELTA LOCATION`) when it first starts. The executor initializes the metastore anyway, so the sampler's metastore start (about 5–10 s) goes away. This changes §4.3 and §6.3.
+7. **Read prod as Parquet, not Delta.** Prod is written once and never changed, so its Parquet files are its content. This skips snapshot reconstruction on prod, but breaks "one engine, real Delta" and would silently break if prod is ever updated. Last resort.
+8. **Start sampling earlier.** Start building the sandbox when the agent is built, or when a thread starts, instead of on the first tool call. This hides the wait instead of shortening it.
+
+Not an option: sampling inside the executor container to save one JVM start. The executor must never see `prod_catalog` (§7).
+
 ---
 
 ## 5. Phase 3 — Security & AST inspection layer
@@ -291,6 +331,13 @@ The logical namespace is `sandbox_catalog.agent_{agent_id}_{session_id}`, used i
 def check(code: str, language: Literal["sql", "pyspark"]) -> PolicyReport:
     """Mode-free. Raises SandboxSecurityException for code blocked in every mode."""
 
+TableRef = str                    # dotted name, lowercase, unquoted: "prod_catalog.silver.posts"
+
+class Location(BaseModel):
+    statement: int | None         # SQL: index of the statement, from 0
+    line: int | None              # Python line/col; for SQL inside spark.sql, the call's position
+    col: int | None
+
 class PolicyReport(BaseModel):
     reads: set[TableRef]          # tables read, when statically known
     writes: list[WriteOp]         # every write found, in every mode
@@ -298,7 +345,7 @@ class PolicyReport(BaseModel):
 
 class WriteOp(BaseModel):
     kind: Literal["INSERT", "UPDATE", "DELETE", "MERGE", "CREATE_TABLE", "CREATE_VIEW",
-                  "ALTER_TABLE", "DROP_TABLE", "TRUNCATE", "SAVE_AS_TABLE", "WRITE_TO"]
+                  "ALTER_TABLE", "DROP_TABLE", "DROP_VIEW", "TRUNCATE", "SAVE_AS_TABLE", "WRITE_TO"]
     target: TableRef | None       # None when the name is built at runtime
     location: Location
 
@@ -317,6 +364,8 @@ class SandboxSecurityException(Exception):
 
 `insertInto` is reported as `INSERT`, so `INSERT` covers both the SQL statement and the DataFrame call.
 
+`check` raises on the first blocked construct. `WriteOp.kind` is an internal label for code and `runs.jsonl`; people and the agent see the statement itself (§8.3).
+
 ### 5.2 One policy, two call sites
 
 The same `check` function runs in two places. Neither place repeats the other's work:
@@ -328,7 +377,7 @@ The same `check` function runs in two places. Neither place repeats the other's 
 
 **Table names are checked only at runtime**, because only the container knows which tables and temp views exist right now (including tables the agent created and temp views from earlier calls). The host does not check table names.
 
-Statement kinds and Python imports are short **allowlists** (unknown is blocked). SQL functions use a short **blocklist**. Code that fails to parse is blocked. The red-team suite (§11.3) proves the container contains whatever the policy misses.
+Statement kinds, Python imports, and the modules an attribute chain may pass through are short **allowlists** (unknown is blocked). SQL functions use an **audited blocklist**: every function of the pinned Spark version was reviewed once, and a Docker test fails when the image's `SHOW FUNCTIONS` output changes, so an upgrade forces a new review. Code that fails to parse is blocked. The red-team suite (§11.3) proves the container contains whatever the policy misses.
 
 ### 5.3 SQL policy (sqlglot, dialect `spark`)
 
@@ -336,17 +385,24 @@ This applies to `run_sql` and to every SQL string passed to `spark.sql` in PySpa
 
 | Statement | Result |
 |---|---|
-| `SELECT`, `WITH … SELECT`, `EXPLAIN`, `DESCRIBE`, `SHOW TABLES/SCHEMAS/COLUMNS/CATALOGS` | read |
-| `CREATE TEMP VIEW` | read (session-local) |
+| `SELECT` (and `UNION`/`INTERSECT`/`EXCEPT`), `WITH … SELECT`, `DESCRIBE` (incl. `DETAIL`, `HISTORY`, `EXTENDED`), `SHOW TABLES/SCHEMAS/DATABASES/COLUMNS/CATALOGS` | read |
+| `EXPLAIN <stmt>` | same as `<stmt>` (a write inside still counts as a write, though EXPLAIN never runs it) |
+| `CREATE TEMP VIEW`, `DROP VIEW <1-part name>` | read (session-local temp view) |
 | `INSERT`, `UPDATE`, `DELETE`, `MERGE` | write |
-| `CREATE TABLE [AS]`, `CREATE VIEW`, `ALTER TABLE`, `DROP TABLE`, `TRUNCATE` | write |
-| `CREATE/DROP CATALOG/SCHEMA/DATABASE`, `USE` | blocked |
-| `SET`, `RESET`, `ADD JAR/FILE`, `CREATE FUNCTION`, `REFRESH`, `CACHE`/`UNCACHE`, `MSCK`, `VACUUM`, `OPTIMIZE` | blocked |
+| `CREATE TABLE [AS]`, `CREATE VIEW`, `ALTER TABLE`, `DROP TABLE`, `DROP VIEW <3-part name>`, `TRUNCATE` | write |
+| `CREATE/DROP CATALOG/SCHEMA/DATABASE`, `USE`, `CREATE GLOBAL TEMP VIEW` | blocked |
+| `SET`, `RESET`, `ADD JAR/FILE`, `CREATE FUNCTION`, `REFRESH`, `CACHE`/`UNCACHE`, `MSCK`, `VACUUM`, `OPTIMIZE`, `EXECUTE IMMEDIATE`, `BEGIN … END` scripts | blocked |
 | anything else | blocked |
 
+sqlglot keeps `SHOW` and `EXPLAIN` as unparsed text and fails on `DESCRIBE DETAIL`; `policy/sql.py` parses the table name or inner statement of these itself, so the rules below apply to them too.
+
 Additional rules:
-- **No path-based sources:** ``delta.`/path` ``, ``parquet.`/path` ``, `read_files(...)`, `LOCATION '…'`, and other string-literal table sources are blocked.
-- **Function blocklist** (data in `policy/sql.py`): `reflect`, `java_method`, `input_file_name`, `input_file_block_start`, `input_file_block_length`. The hidden `_metadata` column is also blocked. The last four would leak sandbox paths (§6.5).
+- **No path-based sources:** ``delta.`/path` ``, ``parquet.`/path` `` (any table name part containing `/`), table-valued functions with a string-literal argument (`read_files('/p')`; `range(10)` is fine), `LOCATION '…'`, `INSERT OVERWRITE DIRECTORY`, and `OPTIONS (path …)` are blocked.
+- **Function blocklist** (audited against Spark 4.2.0's 577 functions, data in `policy/sql.py`):
+  - call Java: `reflect`, `java_method`, `try_reflect`;
+  - read a path: `table_changes_by_path`, `from_protobuf`, `to_protobuf` (descriptor file);
+  - leak sandbox paths or names (§6.5): `input_file_name`, `input_file_block_start`, `input_file_block_length`, `current_path` (returns `spark_catalog.default`).
+  - Any identifier `_metadata` is also blocked. `python_worker_logs` needs a `SET` to work, which is blocked.
 - **Table names:** checked at runtime (§6.1).
 
 ### 5.4 PySpark policy (Python `ast`)
@@ -356,12 +412,18 @@ Additional rules:
 | Imports allowed only from: `pyspark.sql`, `pyspark.sql.functions`, `pyspark.sql.types`, `pyspark.sql.window`, `math`, `datetime`, `decimal`, `json`, `re`, `collections`, `itertools`, `functools`, `statistics`, `typing` | others blocked |
 | Builtins `exec`, `eval`, `compile`, `__import__`, `open`, `getattr`, `setattr`, `delattr`, `globals`, `locals`, `vars`, `input`, `breakpoint`, `memoryview`, `exit`, `quit`, `help` | blocked |
 | Underscore names and attributes (see below) | blocked |
-| `spark.sparkContext`, `.rdd.pipe`, `addFile`, `addPyFile`, `spark.conf.set`, `spark.udf.registerJavaFunction`, `spark.newSession`, `SparkSession.builder` | blocked |
-| Path-based reads: `spark.read.load/parquet/csv/json/text/orc`, `.format(...).load(...)` | blocked (hint: use `spark.table`) |
+| Module attributes: a chain that starts at a module (`T.os`, `F.sys`, `typing.sys`, `pyspark.SparkContext` after `import pyspark.sql`) may only pass through allowed modules. A module name may only be used as `name.attr` (no `m = T`) | others blocked |
+| Attributes `sparkContext`, `rdd`, `catalog`, `pipe`, `addFile`, `addPyFile`, `registerJavaFunction`, `newSession`, `builder`, `dataSource`, `addArtifact`, `addArtifacts`, `copyFromLocalToFs`, `inputFiles`, and `conf.set` | blocked (hints: SQL `SHOW TABLES`/`DESCRIBE` for `catalog`, DataFrame methods for `rdd`) |
+| Python names of blocked SQL functions (`F.reflect`, `F.input_file_name`, …, the §5.3 list) and `F.call_function` | blocked |
+| String literals `"_metadata"` or `"_metadata.…"` | blocked |
+| SQL expression strings: a string literal passed to `F.expr`, `selectExpr`, `filter`, or `where` | checked with the §5.3 function and `_metadata` rules |
+| Path-based reads: `spark.read.load/parquet/csv/json/text/orc`, `.format(...).load(...)`, `readStream` | blocked (hint: use `spark.table`) |
 | `spark.table("…")`, `spark.read.table("…")`, `spark.sql("…")` | read |
 | `.write…saveAsTable`, `.write…insertInto`, `.writeTo(…)` | write (table-name targets only) |
-| Path-based writes (`.save(path)`, `.parquet(path)`, …), `.writeStream` | blocked |
+| Path-based writes (`.save(path)`, `.parquet(path)`, …), a writer `path` option (`.option("path", …)`, `.options(path=…)`, `.saveAsTable(…, path=…)`), `**` unpacking in `.options(…)` or `.saveAsTable(…)` (it may hide `path`), `.writeStream` | blocked |
 | Python UDFs (`F.udf`, `pandas_udf`) | allowed; their bodies are part of the code, so the same rules apply |
+
+The runtime wrapper also wraps `F.expr`, `selectExpr`, `filter`, and `where`, so SQL expression strings built at runtime are checked too (§6.1).
 
 **Underscore rules.** Private attributes are the way from PySpark into the JVM (`spark._jvm`, `spark._jsparkSession`, `df._jdf`, `sc._jsc`) and into Python internals (`x.__class__.__bases__`). Plain local names are not. So:
 
@@ -382,7 +444,7 @@ The hint for a blocked `row._1` is `row["_1"]`.
 
 ### 5.5 Known limits (documented, accepted)
 
-A static check of Python can't be complete. The red-team suite (§11.3) tracks known bypass classes. Anything that gets past §5 is still confined by §7: no prod data, no network, nothing on disk outside its own `/sandbox`, and resource limits.
+A static check of Python can't be complete. The red-team suite (§11.3) tracks known bypass classes, among them aliases that hide a call chain (`r = spark.read; r.parquet(p)`) and `str.format` reading private attributes (`"{0.__class__}".format(x)`; it can read but not call). Anything that gets past §5 is still confined by §7: no prod data, no network, nothing on disk outside its own `/sandbox`, and resource limits.
 
 ---
 
@@ -394,7 +456,12 @@ A static check of Python can't be complete. The red-team suite (§11.3) tracks k
 
 All rewriting happens **inside the container, at runtime**. The host never rewrites code. There is no static PySpark rewriter.
 
-The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `DataFrameWriter.saveAsTable`, `DataFrameWriter.insertInto`, and `DataFrame.writeTo` before agent code runs. `run_sql` runs each statement through the wrapped `spark.sql`, so both tools take the same path. Gold `transform`s in the jobs container use the same rewriter.
+The runtime wrapper replaces `spark.sql`, `spark.table`, `spark.read.table`, `DataFrameWriter.saveAsTable`, `DataFrameWriter.insertInto`, `DataFrame.writeTo`, and the SQL-expression entry points `F.expr`, `DataFrame.selectExpr`, `DataFrame.filter`, and `DataFrame.where` (string arguments only; these get the §5.3 function and `_metadata` rules) before agent code runs. `run_sql` runs each statement through the wrapped `spark.sql`, so both tools take the same path. Gold `transform`s in the jobs container use the same rewriter.
+
+- **Lowest entry point only.** It patches the classes, at the method the others call (for example `spark.table` calls `DataFrameReader.table`, so only that is patched). Each name is checked and rewritten exactly once; a test proves it.
+- **Path methods are blocked at runtime too.** The reader and writer path methods (§5.4 `PATH_METHODS`) always raise. This closes the alias gap of §5.5 (`w = df.write; w.save(p)`), so `allow_writes` holds for every write.
+- **`spark.sql` takes only the query string.** Extra arguments (`args=`, `{name}` keyword formatting) are blocked with the hint "use one SQL string", because they hide table names from the rewrite.
+- **The wrapper is passed in at startup** (`install`). The red-team containment tests (§11.3) start the runtime without it: raw Spark, no checks, rewrites, or blocks. The host picks it in the start command; the agent has no way to choose it.
 
 For each SQL string (parsed with sqlglot) or table name, the wrapper:
 1. runs `policy.check` on it (§5.2), and blocks writes if `allow_writes` is false;
@@ -404,19 +471,20 @@ For each SQL string (parsed with sqlglot) or table name, the wrapper:
 |---|---|
 | `prod_catalog.<schema>.<table>`, schema in `bronze`/`silver`/`gold` | rewritten to `<schema>.<table>`. If the table doesn't exist, Spark's own "table not found" error is returned, reverse-mapped |
 | 1-part name that is a CTE in the same statement, or a temp view in the session (from this call or an earlier one) | left as is |
+| 1-part target of `CREATE TEMP VIEW` or `DROP VIEW` | left as is (the view may not exist yet) |
 | any other 1-part name, any 2-part name | blocked, with a hint showing the 3-part form |
 | any other catalog or schema | blocked |
 
 3. replaces `current_catalog()` with the literal `'prod_catalog'` (§6.5);
 4. runs the rewritten statement.
 
-Because the metastore (§6.3) knows every table in the sandbox, **tables the agent created** (`CREATE TABLE prod_catalog.gold.my_summary …`) can be read in later calls like any other table. Temp views from earlier calls work too, until the container restarts (Spark itself drops them; the agent gets Spark's "not found" error).
+Because the metastore (§6.3) knows every table in the sandbox, **tables the agent created** (`CREATE TABLE prod_catalog.gold.my_summary …`) can be read in later calls like any other table. Temp views from earlier calls work too, until the container restarts. Spark drops them then, and the name is blocked like any other unknown 1-part name (`TABLE_NAME_NOT_ALLOWED`).
 
 The wrapper returns the list of rewritten statements, which goes into `runs.jsonl` as `rewritten_sql`.
 
 ### 6.2 Tools and engine
 
-There is one engine, **local PySpark 3.5+ with delta-spark**, and two tools:
+There is one engine, **local PySpark 4.2 with delta-spark**, and two tools:
 
 - **`run_sql(query: str)`** runs `spark.sql(query)` for each statement. The result is the last statement's DataFrame.
 - **`run_pyspark(code: str)`** runs the code with `spark`, `F` (`pyspark.sql.functions`), and `T` (`pyspark.sql.types`) predefined. The result is the variable `result` if it is set, otherwise the value of the last expression if it is a DataFrame. Otherwise only stdout is returned.
@@ -432,12 +500,17 @@ There is one engine, **local PySpark 3.5+ with delta-spark**, and two tools:
   - Derby allows one process at a time. The sampler (jobs container) finishes before the executor starts, which the creation lock guarantees (§9.5).
   - Cost: a few seconds added to Spark startup.
   - Hive support and Delta together must be checked against the pinned versions when building the image.
+  - `spark.sql.sources.default=delta`, so `CREATE TABLE … AS` and `saveAsTable` without a format make Delta tables, as on Databricks.
 - **Protocol:** newline-delimited JSON on the container's stdin/stdout, attached by the host through the Docker SDK. There are no sockets and no network.
   - Request: `{run_id, language, code, allow_writes}`. Response: a `RunResult` (§6.4).
-  - At startup the runtime moves the protocol channel to a private copy of file descriptor 1, and points descriptor 1 at a capture file in `/tmp`. Nothing the agent prints can reach the protocol channel by accident.
+  - At startup, **before Spark starts**, the runtime moves the protocol channel to a private copy of file descriptor 1, and points descriptor 1 at descriptor 2 (stderr, kept by `docker logs`). Nothing the agent or the JVM prints can reach the protocol channel by accident, and no file fills `/tmp`.
+  - After Spark starts, the runtime sends one `{"ready": true}` line. The client waits for it before the first request; startup does not count toward `run_timeout`.
+  - The client attaches to stdin/stdout **before** starting the container and keeps that connection, so no line is lost or replayed.
+  - `run_id` must match `[A-Za-z0-9_-]{1,128}`, because it names the result file.
   - The host treats every response as untrusted: it validates it with pydantic and rejects lines larger than `MAX_RESPONSE_BYTES` (`config.py`).
 - **Logs:** Spark's log level is `WARN`. Python stdout and stderr are captured per run into `RunResult` (8 KB each). JVM logs go to the container's stderr and are kept by Docker (`docker logs <container>`), with no extra code.
-- **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is killed and restarted, and the run is recorded as `TIMEOUT`. Tables survive (metastore); temp views and cached data are lost.
+- **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is stopped and the run is recorded as `TIMEOUT`; the sandbox's next run restarts it. Tables survive (metastore); temp views and cached data are lost.
+  - A broken answer (larger than `MAX_RESPONSE_BYTES`, or the output closed) stops the container the same way, because its output may be out of step. `restart_executor` starts the same container again on a new connection.
 - **Container limit:** at most `max_containers` (default `2`) executor containers run at once, counted by the label `dbrix.sandbox_id=<id>` across all host processes. To start a new one when the limit is reached, the client stops the least recently used container that is not running a run. Its sandbox stays on disk and its container restarts on demand.
   - If every container is busy running a run, the call **waits** for a free slot, up to `run_timeout`. If none frees up in time, the agent gets an error `ToolMessage`: "executor busy, try again". This wait does not count toward the call's own run timeout. In async code it happens in the worker thread (§8.2).
 
@@ -472,17 +545,20 @@ The agent should never see that it is not on Databricks `prod_catalog`. The plac
 
 | Leak | Handling |
 |---|---|
-| Table names in errors and stack traces (`silver.posts`, `spark_catalog.silver.posts`) | Reverse-mapped to `prod_catalog.silver.posts`. Stack frames from the dbrix runtime are removed |
-| Paths (`/sandbox/silver/posts`, `/sandbox/...`) in any text | `/sandbox/<schema>/<table>` → `prod_catalog.<schema>.<table>`; any other `/sandbox` path → `<sandbox>` |
+| Table names in errors and stack traces (`silver.posts`, `spark_catalog.silver.posts`, and Spark's quoted form `` `silver`.`posts` ``) | Reverse-mapped to `prod_catalog.silver.posts` (quoted names stay quoted). Errors carry Spark's message (no JVM stack trace by default); a Python traceback shows only frames of the agent's own code (compiled as `<agent>`) |
+| Paths (`/sandbox/silver/posts`, `file:/sandbox/...`) in any text | `/sandbox/<schema>/<table>` → `prod_catalog.<schema>.<table>`; any other `/sandbox` path → `<sandbox>` |
 | Output rows of `SHOW`, `DESCRIBE` (incl. `DETAIL`, `HISTORY`, `EXTENDED`), `EXPLAIN` | The same reverse mapping is applied to every string value in these results, so `SHOW CATALOGS` returns `prod_catalog` and locations hide sandbox paths |
-| stdout and stderr | Same reverse mapping |
+| stdout and stderr | Same reverse mapping, always, even when the agent prints data rows (rare false matches are accepted) |
+| PySpark's own error log (`DataFrameQueryContextLogger`, `SQLQueryContextLogger`), which prints every Spark error to stderr with the JVM stack trace and container paths | Disabled in the executor runtime; the error reaches the agent once, as `AgentError` |
 | `current_catalog()` | Rewritten to `'prod_catalog'` (§6.1) |
 | `input_file_name()` and related, `_metadata` column | Blocked by the policy (§5.3), with a hint |
 | Catalog docs (`/catalog/`) | Always generated with prod names |
 
 Reverse mapping is **not** applied to the data rows of normal queries (a `SELECT` over user data), so real data is never changed.
 
-**Known leaks (accepted):** the Spark version, the exact text of some Spark error messages, and the `default` schema in `SHOW SCHEMAS`.
+**Known leaks (accepted):** the Spark version, the exact text of some Spark error messages, the `default` schema in `SHOW SCHEMAS` and `current_database()`, and the container user `dbrix` in `current_user()`.
+
+The class name `SandboxSecurityException` is not shown to the agent: `AgentError.type` for policy errors is `SecurityException`.
 
 ---
 
@@ -492,7 +568,7 @@ Reverse mapping is **not** applied to the data rows of normal queries (a `SELECT
 
 ```
 --network none
---read-only  --tmpfs /tmp:rw,size=1g
+--read-only  --tmpfs /tmp:rw,exec,nosuid,size=1g          # exec: Spark loads native codecs from /tmp
 --mount type=bind,src=<sandbox_dir>,dst=/sandbox      # only data mount
 --user 10001:10001
 --cap-drop ALL  --security-opt no-new-privileges
@@ -534,13 +610,14 @@ DbrixSandboxMiddleware(
 - **Errors as feedback:** policy violations and runtime errors become a `ToolMessage` with `status="error"` and a hint, so the agent can correct itself. They are never raised into the graph. (Host configuration errors, such as `InvalidSandboxIdError`, are raised.)
 - **Lazy creation:** the first intercepted call creates the sandbox (sampling plus container start, roughly 15–30 s). The middleware streams a progress custom event so UIs can show it.
 - **Recreation notice:** the middleware keeps `dbrix_sandbox_created_at` in agent state (middleware `state_schema`). If the sandbox's `created_at` no longer matches (it was GC'd and rebuilt), the `ToolMessage` starts with: "Note: your sandbox expired and was recreated from the same starting data. Tables you created or changed earlier are gone." The state is then updated.
-- Exact hook signatures, `state_schema`, and how a tool call returns a state update must be checked against the current LangChain v1 docs when implementing.
+- Checked against LangChain 1.4.7: `wrap_tool_call(request, handler)` / `awrap_tool_call` return a `ToolMessage` or a `Command`; the state update is a `Command(update={"messages": [...], "dbrix_sandbox_created_at": ...})`. `session_id` comes from `request.runtime.config["configurable"]["thread_id"]`; the progress event goes through `get_stream_writer()`.
+- In READ_ONLY, code with static writes is answered with an error (`rule_id` `READ_ONLY_WRITE`, logged as `POLICY_BLOCKED`); dynamic SQL alone runs with `allow_writes=false`, so the runtime wrapper blocks it if it writes.
 
 ### 8.3 Human approval for writes (READ_WRITE)
 
 `interrupt_on` in Deep Agents is configured **per tool name**, but we need approval **only when the code writes**. The middleware therefore raises the LangGraph `interrupt()` itself, using the **same request and decision shape as Deep Agents' HITL middleware**, so any client that handles `interrupt_on` handles ours with no changes.
 
-- **Interrupt payload:** tool name, the code, the `WriteOp` list (kind, target table in prod names or "unknown", location), the dynamic-SQL warning if relevant, and the sandbox id.
+- **Interrupt payload:** tool name, the code, the `WriteOp` list (kind, target table in prod names or "unknown", location), the dynamic-SQL warning if relevant, and the sandbox id. The person approving is shown each write as the agent's own statement (e.g. `DROP VIEW prod_catalog.gold.v`), not the internal `kind` label.
 - **Decisions:**
   - `approve` runs the code as is, with `allow_writes=true`.
   - `edit` runs the human-edited code, which **goes through the policy again** and asks again if it still writes.
@@ -555,7 +632,7 @@ DbrixSandboxMiddleware(
 2. `run_id` is the LangChain `tool_call_id`. The run log skips a `run_id` it has already written, so a repeated step never logs twice.
 3. The approved code runs after `interrupt()` returns, so it runs once per decision.
 4. Accepted gap: if the host crashes after an approved write ran but before the checkpoint was saved, the write may run again on resume. The sandbox is disposable, so this is accepted.
-5. To check when implementing: whether LangChain v1 runs each tool call of a step as a separate task (then only the interrupted call repeats). If not, other read calls in the same step repeat too; that is harmless, and rule 2 keeps the log clean.
+5. Checked: LangChain 1.4.7 runs each tool call of a step as a separate task (`Send` per call), so only the interrupted call repeats.
 
 ### 8.4 `create_sandboxed_deep_agent(...)`
 
@@ -569,6 +646,7 @@ agent = create_sandboxed_deep_agent(
     sampling=SamplingConfig(sample_size=5),   # passed to the SandboxManager
     subagents=[...],          # optional extra subagents; middleware injected automatically
     extra_tools=[...],        # non-code tools only
+    # also: config (default dbrix.toml), docker (default from_env()), checkpointer
 )
 agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": "s1"}})
 ```
@@ -579,21 +657,37 @@ It configures:
 |---|---|
 | `tools=` | `run_sql`, `run_pyspark`, plus `extra_tools` |
 | `middleware=` | `DbrixSandboxMiddleware(...)` |
-| **Backend** | `CompositeBackend`: `/catalog/` → `FilesystemBackend` over generated catalog docs; `/results/` → `FilesystemBackend` over the session's `_results/`; `/` → `StateBackend` (agent scratch and notes) |
-| **`permissions=`** | Deny `write` on `/catalog/**` and `/results/**`, so the agent can read them but not change them |
-| **Excluded tools** | Remove `execute` (sandbox shell) and `eval` (JS interpreter) via a `HarnessProfile(excluded_tools=…)`. No sandbox backend is ever configured. Our two tools are the only code-execution path |
-| **Subagents** | Built-in **`explorer`**: profiles tables and returns findings, and gets the same tools with a middleware instance forced to READ_ONLY. Each user-supplied subagent has `DbrixSandboxMiddleware` **injected** into its `middleware` list. The general-purpose subagent gets it too |
-| **`memory=`** | A generated `AGENTS.md`: what the catalog is, the 3-part naming rule, the medallion layers, how to use the tools, the current mode, and that writes need approval |
-| **Skills** | `databricks-analyst` SKILL.md: Spark SQL vs PySpark patterns, common joins in this domain, reading `/results`, and handling policy errors |
+| **Backend** | `CompositeBackend`: `/catalog/` and `/results/` → `SandboxFiles`, a read-only backend that finds the current thread's sandbox on each call (Deep Agents 0.7 takes only fixed backend objects, and the agent serves every thread) and reads its `_catalog/` or `_results/`; reading builds the sandbox when it doesn't exist yet. `/skills/` → `FilesystemBackend` over the packaged skills. `/` → `StateBackend` (agent scratch and notes) |
+| **`permissions=`** | Deny `write` on `/catalog/**`, `/results/**`, and `/skills/**`, so the agent can read them but not change them |
+| **Excluded tools** | No sandbox backend is ever configured, so Deep Agents hides `execute` itself (it drops tools the backend can't serve). No `HarnessProfile`: it is registered per process and model, not per agent. Deep Agents 0.7 has no `eval` tool. A test checks that neither appears. Our two tools are the only code-execution path |
+| **Subagents** | Built-in **`explorer`**: profiles tables and returns findings, and gets the same tools with a middleware instance forced to READ_ONLY. Each user-supplied subagent has `DbrixSandboxMiddleware` **injected** into its `middleware` list. Deep Agents' default general-purpose subagent would not inherit our middleware, so the factory passes its own `general-purpose` (Deep Agents' `GENERAL_PURPOSE_SUBAGENT` plus the main tools and the middleware), which replaces the default |
+| **`system_prompt=`** | The generated agent instructions (the planned `AGENTS.md`): what the catalog is, the 3-part naming rule, the medallion layers, how to use the tools, the current mode, and that writes need approval. Passed as the system prompt, not `memory=`: no file or route, and the agent can't edit it |
+| **Skills** | `databricks-analyst` SKILL.md (`skills=["/skills/"]`): Spark SQL vs PySpark patterns, common joins in this domain, reading `/results`, and handling policy errors |
 | Checkpointer | `InMemorySaver` unless one is supplied |
 
-**`/catalog/` contents** are generated once, when the sandbox is created, from the manifest and sandbox metadata, always using prod-facing names: `README.md` (schema overview, ER diagram as text, and the sampling limitation from §4.2), and `<schema>/<table>.md` (description, columns with types and descriptions, PK, FKs, sandbox row count, five sample rows). Tables the agent creates later are not in `/catalog`; the agent can `DESCRIBE` them.
+**`/catalog/` contents** are generated once, when the sandbox is created, by the sampler job at its end (Spark is running and the selected rows are in memory), into `<sandbox>/_catalog/`, always using prod-facing names: `README.md` (schema overview, ER diagram as text, and the sampling limitation from §4.2), and `<schema>/<table>.md` (description, columns with types and descriptions, PK, FKs, sandbox row count, five sample rows). Tables the agent creates later are not in `/catalog`; the agent can `DESCRIBE` them.
 
-**Enforcement test:** after building the agent, the factory checks every graph node (main agent and all subagents) that exposes a tool in `tool_map`. Each must have `DbrixSandboxMiddleware`, otherwise the factory raises `MisconfiguredSandboxError`. The fail-closed stubs (§8.1) are the second line of defense.
+**Enforcement test:** before building the agent, the factory checks every subagent that can call a tool in `tool_map` (a spec without `tools` gets the main agent's). Each must have `DbrixSandboxMiddleware`, otherwise the factory raises `MisconfiguredSandboxError`. A compiled subagent (`CompiledSubAgent`) can't be given the middleware, so one whose graph has a code tool is rejected. The main agent gets it by construction. The fail-closed stubs (§8.1) are the second line of defense.
 
 The same middleware also works with plain `langchain.agents.create_agent` (see `examples/langchain_agent_demo.py`). The backend, memory, skill, and subagent features are Deep Agents-only.
 
-Exact Deep Agents parameter names (`HarnessProfile`, `permissions` rule shape, skills parameter, subagent `middleware` field) must be checked against the installed version when implementing.
+Checked against Deep Agents 0.7.32. The agent libraries (`langchain`, `langgraph`, `deepagents`, `mcp`) are a host-only dependency group (`agents`); the `dbrix-spark` image installs no default group (§6.3).
+
+### 8.5 MCP server
+
+`python -m dbrix.mcp_server --transport stdio|http` lets any MCP client (Claude Code, Claude Desktop) use the sandbox. The client is the agent; dbrix answers its code tools and serves its own docs, so nothing from dbrix is installed on the client. Built on the official `mcp` SDK's `MCPServer`.
+
+- **One core.** The middleware and the MCP server are thin front doors over `dbrix.calls.answer` (§1). Policy, mode, logging, formatting, and the recreation notice live there once.
+- **READ_ONLY only.** The mode is fixed, not read from `default_mode`. Writes get the §8.2 READ_ONLY error. Approval over MCP is deferred (§13).
+- **Tools:** `run_sql(query)` and `run_pyspark(code)`, with the names and descriptions of the §8.1 stubs. A result is the same text as the middleware's; an error sets `isError`. `run_id` is a fresh uuid (MCP has no tool-call id).
+- **One sandbox per server process,** on both transports: `agent_id` is `mcp`, `session_id` a uuid made at startup. MCP 2026-07-28 has no sessions over HTTP, and clients send no conversation id, so there is nothing finer to key on. Every client of one HTTP server shares its sandbox; run another server for another sandbox. The server keeps the sandbox's `created_at` in memory for the recreation notice.
+- **Instructions:** the §8.4 agent instructions for READ_ONLY, plus one line: files under `/catalog` and `/results` are the resources below.
+- **Resources** (read-only, path = the agent-visible path under `dbrix://`): `dbrix://catalog/{path}` (`_catalog/`; reading builds the sandbox), `dbrix://results/{path}` (`_results/`), `dbrix://skills/{path}` (the packaged skills). The SDK rejects `..`, absolute paths, and NUL bytes. The server also resolves the path and refuses one outside its root, because the untrusted executor can leave symlinks in `_results/` (§7).
+- **Progress:** while the sandbox builds, the tool sends one progress notification (a no-op when the client asked for none).
+- **HTTP:** Streamable HTTP on `[mcp] host:port`, path `/mcp`. Every request needs `Authorization: Bearer <[mcp] token>` (constant-time compare), else 401; the server refuses to start over HTTP without a token. On localhost the SDK's DNS-rebinding check applies. TLS is the deployer's job (reverse proxy or load balancer).
+- **Containment:** a remote server keeps `prod_catalog` off the client's machine. A local stdio server does not contain a client that has its own shell and file tools (Claude Code reads files directly); deny those paths in the client's settings, or use a remote server.
+
+Checked against `mcp` 2.3.0.
 
 ---
 
@@ -636,7 +730,7 @@ CREATING ──ok──▶ IDLE ──run──▶ ACTIVE ──success──▶
 ```
 
 - `CREATING` exists only in a `.creating-<id>` dir (§9.5). A finished sandbox starts at `IDLE`.
-- `FAILED` means the last run or creation failed. It is kept until the TTL expires so it can be debugged.
+- `FAILED` means the last run or creation failed. A run is code that reached the executor: any outcome other than `OK` (`RUNTIME_ERROR`, `TIMEOUT`, or a block by the runtime wrapper) sets `FAILED`, and the next run moves it on. Calls that never ran (`POLICY_BLOCKED` on the host, `REJECTED`) are logged and count as activity (`last_used_at`), but change neither the status nor `run_count`. A failed creation is kept until the TTL expires so it can be debugged.
 - A pending approval is not a status. It lives in the LangGraph checkpoint (§8.3).
 
 ### 9.3 `runs.jsonl` (append-only, one line per run)
@@ -649,7 +743,7 @@ The writer skips a `run_id` that is already in the file (§8.3). Policy-blocked 
 
 `dbrix.lifecycle.gc.run(sandbox_root: Path, ttl_seconds: int, run_timeout: int, docker: DockerClient, now: datetime | None = None, dry_run: bool = False) -> GcReport`, also runnable as `python -m dbrix.lifecycle.gc` (which reads `dbrix.toml` and passes the values in). It is idempotent. The README ships cron and systemd-timer examples to run it hourly.
 
-For each `sandbox_root/agent_*` directory:
+For each `sandbox_root/agent_*` directory (GC never waits for a lock: a busy sandbox is in use and skipped; under the lock, steps 1–3 are checked again):
 1. Read the meta. If it is missing or corrupt, use the directory's mtime as `last_used_at`.
 2. Skip it if `active_run` is set and its `started_at` is less than `2 × run_timeout` ago. An older `active_run` means a crashed run, which counts as idle.
 3. If `now − last_used_at > ttl_seconds` (measured from **last activity**): take the sandbox lock, stop and remove its container (by label), then delete the directory.
@@ -668,9 +762,12 @@ A sandbox can be GC'd while an approval is pending. On resume it is rebuilt from
   3. if a `.creating-<id>` dir exists, it is left from a crash: delete it;
   4. build the sandbox in `.creating-<id>` (jobs container mounts it at `/sandbox`);
   5. write the meta with status `IDLE`, then rename the dir to `agent_{…}` (a rename is atomic);
-  6. start the executor, release the lock.
+  6. release the lock. The executor is started by the first run, not here: runs are the only place a container starts (§6.3 container limit).
   If building fails, the `.creating-<id>` dir is kept with status `FAILED` and the error, the agent gets an error `ToolMessage`, and the next call starts over at step 3.
 - The jobs container and the executor never open the same Derby metastore at once, because the executor only starts after step 5.
+- A run takes the lock, then makes sure the sandbox exists (rebuilding it if GC removed it while an approval was pending) and returns the sandbox it ran on, so the middleware can compare `created_at`.
+- **Container limit:** a global lock `.locks/_executors.lock` makes "count running containers, evict, start" one step across host processes. Eviction stops (does not remove) the least recently used container (by `last_used_at`) whose sandbox lock is free. A waiting call looks again every second.
+- A host process keeps a handle only for containers it started. A container of the sandbox it has no handle for (another process, a host restart) is removed and a new one started, because attaching to a running container could lose lines. A handle whose container id differs from the meta's `container_id` (the sandbox was rebuilt) is dropped the same way.
 
 ### 9.6 Rebuilding after GC
 
@@ -709,23 +806,30 @@ result_file_max_rows = 10000
 
 [lifecycle]
 ttl_seconds = 86400
+
+[mcp]
+host  = "127.0.0.1"
+port  = 8765
+# token = "..."   # required for --transport http
 ```
 
 ---
 
 ## 11. Quality, testing & acceptance criteria
 
-**Tooling:** uv, Python 3.12, pytest, ruff, mypy (strict on `src/`). Integration and red-team tests need Docker and run locally (`pytest -m docker`). Agent-level tests use a scripted fake chat model, so no API key is needed.
+**Tooling:** uv, Python 3.12, pytest, ruff, mypy (strict on `src/`). Integration and red-team tests need Docker and run locally: `pytest -m "docker and not slow" --basetemp=.pytest_docker_tmp`. The two scale-1 speed tests (generator, sampler) are marked `slow` and run on demand with `-m slow`, because each needs a scale-1 catalog and takes minutes. Docker runs use their own `--basetemp`, because pytest empties its basetemp at every start and a unit run started meanwhile would delete the Docker run's catalogs. Every Spark container costs 1–2 min (§4.5), so tests keep containers few: properties that only need the selected rows (determinism, the 5 seeds) run in memory in one container, and only one test builds a real sandbox. Agent-level tests use a scripted fake chat model, so no API key is needed.
 
 ### 11.1 Unit
 - Manifest validation catches every error class in §3.1, including self-references and composite FK mismatches.
 - The generator is deterministic: same seed gives an identical content hash per table.
-- Sampler: no dangling FKs and no duplicate PKs for 20 random seeds. The up pass never adds children to tables reached by the down pass. Organic posts and their metrics appear. `raw_creator_profiles` contains only profiles of creators already in the sandbox. Gold equals the transform rerun over the sampled Silver. The same IDs give the same sandbox.
+- Sampler: no dangling FKs and no duplicate PKs for 5 random seeds. The up pass never adds children to tables reached by the down pass. Organic posts and their metrics appear. `raw_creator_profiles` contains only profiles of creators already in the sandbox. Gold equals the transform rerun over the sampled Silver. The same IDs give the same sandbox.
 - IDs: `_`, `.`, `/`, and over-long IDs are rejected.
 - Policy: table-driven cases for every row of §5.3 and §5.4, including each underscore case. `PolicyReport.writes` is correct. `check` gives the same result regardless of mode (it has no mode).
+- Policy (Docker, slow): the image's `SHOW FUNCTIONS` output equals the audited list in `policy/spark_functions.txt`; a change means a new review (§5.2).
 - Rewriter: every row of the §6.1 table. 3-part names round-trip. Reverse mapping removes every sandbox name and path from errors, stdout, and metadata output (§6.5), and leaves normal data rows unchanged.
 - Run log: a repeated `run_id` is written once.
 - GC: fake-clock tests for TTL, `active_run` skip, stale `active_run`, corrupt meta, and leftover `.creating-*` dirs.
+- MCP server (in-process client, fake manager): tools carry the stubs' names and descriptions; a read returns the preview; a write gets the READ_ONLY error with `isError`; the recreation notice; resources resolve, and `..` and a symlink out of the root are refused; HTTP without the token gets 401; no token, no HTTP start.
 
 ### 11.2 Integration (Docker)
 - Deep Agent end to end with a scripted model: lazy sandbox creation, `run_sql`, `run_pyspark`, preview, `/results` file readable with `read_file`, and `/catalog` readable but not writable.
@@ -741,15 +845,16 @@ ttl_seconds = 86400
 - A timeout kills and restarts the container, and the next run succeeds.
 - Agent `print` output never breaks the protocol.
 - The same middleware works with plain `create_agent`.
+- MCP server over stdio (a subprocess): `run_sql` returns a preview and `dbrix://catalog/README.md` is readable.
 
 ### 11.3 Red team (must all fail to touch prod or escape)
-`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
+`getattr(df, "wr"+"ite")`, `__import__("os")`, `().__class__.__bases__…`, `exec(base64…)`, `spark.sparkContext._jvm`, `spark._jsparkSession`, `rdd.pipe("sh")`, `T.os.system("sh")`, `F.sys.modules["os"]`, `F.reflect(…)`, `F.call_function("reflect", …)`, `F.expr("reflect(…)")`, `df.write.option("path", "/x").saveAsTable(…)`, `df.write.saveAsTable(…, path="/x")`, `df.write.options(**{"path": "/x"})`, `spark.catalog.listTables()`, `spark.read.parquet("/prod_catalog/…")`, ``SELECT * FROM delta.`/prod_catalog/silver/posts` ``, `SELECT reflect('java.lang.Runtime', …)`, `EXECUTE IMMEDIATE 'DROP TABLE …'`, `ADD JAR`, `SET spark.…`, `CREATE FUNCTION … USING JAR`, `../` and `_` in agent/session IDs, dynamic `spark.sql(f"DROP TABLE {t}")` in READ_ONLY, an unapproved dynamic write in READ_WRITE (`allow_writes=false`), and network access attempts.
 
-For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own.
+For each case: the policy should block it (this is the feedback layer). Separately, with the policy **disabled** in both places, the container must still keep the attempt away from prod data and the network (this is the security boundary). Both are tested on their own. The containment test sends requests straight to the executor client (no middleware) and starts the runtime without the wrapper (§6.1), with the same isolation flags as a normal executor.
 
 ### 11.4 Acceptance (v0 is done when)
 1. `python -m dbrix.generator` at scale 1 finishes in under 2 min and passes integrity checks.
-2. Sandbox creation with defaults finishes in under 30 s, including first Spark start, and passes FK validation.
+2. Sandbox creation with defaults finishes in under 30 s, including first Spark start, and passes FK validation. *Not met yet: about 120 s measured; see §4.5.*
 3. A Deep Agent built with `create_sandboxed_deep_agent` and a real Claude model answers "Which creator had the best engagement rate for brand X last month?" using an unchanged `run_sql` tool.
 4. In READ_WRITE, an agent's `CREATE TABLE prod_catalog.gold.my_summary AS …` pauses for approval. After approval the table exists only in that sandbox, and the agent can query it in its next call.
 5. Every red-team case is blocked by the policy **and** contained when the policy is disabled.
@@ -773,7 +878,7 @@ For each case: the policy should block it (this is the feedback layer). Separate
 ## 13. Deferred to later versions
 
 - **DuckDB engine** (lighter and faster than Spark; needs Spark→DuckDB transpilation and a Delta write-back strategy).
-- **MCP server** for off-the-shelf clients (Claude Code, Claude Desktop).
+- Writes over MCP (approval via elicitation), and more than one sandbox per MCP server.
 - **CLI** (`dbrix generate / sandbox / gc`).
 - **Claude Agent SDK adapter** and a framework-agnostic `@sandboxed` decorator.
 - **Messy nested-JSON Bronze** with `json_foreign_keys` JSONPath extraction.
@@ -825,3 +930,47 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 29 | Approval resume | — | Nothing is written before `interrupt()`; `run_id = tool_call_id`; the run log skips duplicates |
 | 30 | Concurrency | — | Runs serialized per sandbox; async waits in a worker thread; the timeout counts only running time |
 | 31 | Container limit | — | At most 2 executors. Evict the least recently used idle one; if all are busy, wait up to `run_timeout`, then return "executor busy" |
+| 32 | Sampler fill and islands | separate steps | One parent-first walk: an island is sampled, then its children are filled from it. A filled row needs every non-null FK to point at a selected row, so no unrelated parents are pulled in |
+| 33 | Nullable FKs | — | Read from the data (any null rows), not from the manifest. An FK with no nulls adds no null-FK sample |
+| 34 | Up pass | repeat until nothing changes | One children-first walk; same result on a DAG |
+| 35 | Sampler scope | — | Builds into an empty dir and returns the `sampling` block and row counts. Lock, `.creating` dir, rename, and meta file are the lifecycle layer's job |
+| 36 | SQL function list | short blocklist | **Audited blocklist**: all 577 functions of Spark 4.2.0 reviewed once; a Docker test fails when `SHOW FUNCTIONS` changes. Adds `try_reflect`, `table_changes_by_path`, `from_protobuf`/`to_protobuf`, `current_path` |
+| 37 | Module attributes | — | Allowed modules expose others (`T.os`, `F.sys`, `typing.sys`). An attribute chain from a module may only pass through allowed modules; a module name is used only as `name.attr` |
+| 38 | Spark 4 Python API | — | Block `F.reflect`/`java_method`/`try_reflect`/`call_function`, `spark.catalog`, `df.rdd`, `dataSource`, `addArtifact(s)`, `copyFromLocalToFs`, `inputFiles`, `readStream`, and a writer `path` option |
+| 39 | SQL expression strings | — | `F.expr`, `selectExpr`, `filter`, `where` strings get the function and `_metadata` rules: literals statically, all strings in the runtime wrapper |
+| 40 | `EXPLAIN` | read | `EXPLAIN X` is treated like X (a write inside needs approval though nothing runs). Less code; errs safe |
+| 41 | `DROP VIEW` | — | 3-part name: write `DROP_VIEW`; 1-part (temp view): read. Approval shows the statement, not the label |
+| 42 | `TableRef` | — | Lowercase, unquoted dotted name (Spark names ignore case) |
+| 43 | Wrapper patch points | list of methods | Patch only the lowest entry point, on the classes, so each name is rewritten once. Path methods raise at runtime too, so aliases can't write without approval |
+| 44 | `spark.sql` arguments | — | Only the query string; `args=` and keyword formatting are blocked |
+| 45 | Shared statement parsing | — | Check and rewrite use one `parse_statement` (sqlglot plus the `SHOW`/`EXPLAIN`/`DESCRIBE DETAIL` forms sqlglot can't parse) |
+| 46 | Stray fd 1 output | capture file in `/tmp` | Pointed at stderr (`docker logs`): same protection, nothing fills `/tmp` |
+| 47 | Default table format | — | `spark.sql.sources.default=delta`, as on Databricks |
+| 48 | Reverse mapping of stdout | — | Always applied (option A); quoted names and `file:` paths are covered |
+| 49 | Policy-disabled red-team runs | — | The wrapper is passed to the runtime at startup; containment tests run without it (raw Spark), the strictest case. No flag the agent can reach |
+| 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
+| 51 | Executor `/tmp` | `rw,size=1g` | `rw,exec,nosuid,size=1g`: Docker's tmpfs default is `noexec`, and Spark's snappy/lz4/zstd load a native library they unpack into `/tmp`. No new capability: `/sandbox` already allows exec |
+| 52 | Temp view after a restart | Spark's "not found" error | Blocked as an unknown 1-part name (`TABLE_NAME_NOT_ALLOWED`): the wrapper can't tell a lost view from a wrong name |
+| 53 | Broken executor answer | — | The container is stopped, as on timeout, and restarted in place. A closed connection or a response that fails validation counts as broken |
+| 54 | Run status | `ACTIVE → FAILED` on failure | Any run that reached the executor and did not end `OK` sets `FAILED`; `run_count` counts only those runs. Blocked and rejected calls update `last_used_at` only |
+| 55 | Executor start | at creation (§9.5 step 6) | Only in a run, so the container limit lives in one place. Creation releases the lock after the rename |
+| 56 | Foreign containers | — | A container this host process did not start is removed and started fresh |
+| 57 | GC and busy sandboxes | take the lock | Never wait: skip a busy sandbox, and check expiry again under the lock |
+| 58 | Container limit across processes | label count | Count, evict, and start under one global lock; evict = stop the LRU container whose sandbox lock is free |
+| 59 | Phase 5 scope | §9 | §9 plus all of §8 (middleware, approval, factory, docs, skill). There is no Phase 6 |
+| 60 | Agent libraries | dependencies | Host-only dependency group `agents`; the Spark image (which runs untrusted code) does not install them |
+| 61 | Removing `execute` / `eval` | `HarnessProfile(excluded_tools)` | Nothing to configure: Deep Agents hides `execute` without a shell backend, and has no `eval`. A profile would apply to the whole process. A test checks both are absent |
+| 62 | General-purpose subagent | middleware injected | Our own `general-purpose` spec replaces the default, which would not inherit the middleware |
+| 63 | Per-thread `/catalog` and `/results` | `FilesystemBackend` per route | `SandboxFiles`: a read-only backend that looks up the thread's sandbox per call. Reading builds the sandbox |
+| 64 | Catalog docs and sample rows | at creation | Written by the sampler job into `_catalog/`; sample rows from the selected rows in memory |
+| 65 | `AGENTS.md` | `memory=` | Generated text passed as the system prompt |
+| 66 | Enforcement test | inspect graph nodes | Check subagent specs before building; reject compiled subagents that have a code tool |
+| 67 | READ_ONLY and dynamic SQL | — | Static writes: error before running. Dynamic SQL only: runs with `allow_writes=false` |
+| 68 | PySpark's error log | printed to stderr | Disabled in the runtime: it repeated every Spark error with the JVM stack trace and container paths (§6.5) |
+| 69 | MCP server | deferred | Built, READ_ONLY only (§8.5). Writes over MCP stay deferred |
+| 70 | Shared core | — | `dbrix.calls.answer` runs one call for both front doors; approval is a callback (`interrupt` or none). No agent framework in it |
+| 71 | MCP sandbox identity | per MCP session | Per server process: MCP 2026-07-28 has no HTTP sessions and clients send no conversation id |
+| 72 | MCP files | — | Resources whose URI is the agent-visible path under `dbrix://`; the symlink check mirrors Deep Agents' `FilesystemBackend` |
+| 73 | MCP transports and auth | — | stdio and Streamable HTTP in one server; HTTP needs a bearer token from `dbrix.toml`. No OAuth |
+| 74 | `read_file` in agent text | named | Removed from the instructions and results: the tool's name depends on the client |
+| 75 | MCP dependency | — | `mcp` joins the host-only `agents` group; the server reuses the §8.1 stubs' names and descriptions |

@@ -1,0 +1,30 @@
+# Copy to dbrix.toml to override defaults from src/dbrix/config.py.
+prod_catalog_dir = "./prod_catalog"
+sandbox_root     = "./sandbox_catalog"
+manifest         = "./manifests/influencer_marketing.yaml"
+default_mode     = "READ_ONLY"
+
+[generator]
+seed  = 42
+scale = 1
+
+[sampling]
+sample_size = 5
+unrelated_sample_fraction = 0.05
+
+[executor]
+image = "dbrix-spark:0.1"
+run_timeout = 120
+max_containers = 2
+memory = "4g"
+cpus = 2
+preview_rows = 50
+result_file_max_rows = 10000
+
+[lifecycle]
+ttl_seconds = 86400
+
+[mcp]
+host  = "127.0.0.1"
+port  = 8765
+# token = "..."   # required for --transport http

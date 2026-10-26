@@ -5,17 +5,61 @@ description = "Local Databricks medallion sandbox and AST execution harness (v0)
 requires-python = ">=3.12"
 dependencies = [
     "delta-spark>=4.4.1",
-    "deltalake>=1.6.6",
-    "duckdb>=2.0.0",
-    "pandas>=3.1.0",
-    "pyarrow>=26.0.0",
+    "docker>=7.1.0",
     "pydantic>=2.14.1",
     "pyspark>=4.2.0",
+    "pyyaml>=6.0.2",
     "sqlglot>=30.24.0",
 ]
 
 [dependency-groups]
+agents = [
+    "deepagents>=0.7.32",
+    "langchain>=1.4.7",
+    "langgraph>=1.2.17",
+    "mcp>=2.3.0",
+]
 dev = [
+    "mypy>=1.15.0",
     "pytest>=9.1.1",
     "ruff>=0.17.2",
+    "types-docker>=7.1.0",
+    "types-pyyaml>=6.0.12",
 ]
+
+[tool.uv]
+# The agent libraries run on the host only; the dbrix-spark image installs no default group (§6.3).
+default-groups = ["dev", "agents"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dbrix"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# under the repo: Docker Desktop can only bind-mount shared paths, and /tmp is not one
+addopts = "-m 'not docker' --basetemp=.pytest_tmp"
+# Docker suite: -m "docker and not slow" --basetemp=.pytest_docker_tmp (about 10 min); speed tests at
+# scale 1: -m slow (about 6 min more). pytest empties its basetemp at every start, so a Docker run needs its own:
+# otherwise a unit run started meanwhile deletes the catalogs and sandboxes it is using.
+markers = [
+    "docker: needs Docker and the dbrix-spark image",
+    "slow: speed tests at scale 1; run on demand with -m slow",
+]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["pyspark.*", "delta.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.isort]
+known-third-party = ["docker"]
