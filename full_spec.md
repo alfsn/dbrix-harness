@@ -476,7 +476,7 @@ For each SQL string (parsed with sqlglot) or table name, the wrapper:
 3. replaces `current_catalog()` with the literal `'prod_catalog'` (§6.5);
 4. runs the rewritten statement.
 
-Because the metastore (§6.3) knows every table in the sandbox, **tables the agent created** (`CREATE TABLE prod_catalog.gold.my_summary …`) can be read in later calls like any other table. Temp views from earlier calls work too, until the container restarts (Spark itself drops them; the agent gets Spark's "not found" error).
+Because the metastore (§6.3) knows every table in the sandbox, **tables the agent created** (`CREATE TABLE prod_catalog.gold.my_summary …`) can be read in later calls like any other table. Temp views from earlier calls work too, until the container restarts. Spark drops them then, and the name is blocked like any other unknown 1-part name (`TABLE_NAME_NOT_ALLOWED`).
 
 The wrapper returns the list of rewritten statements, which goes into `runs.jsonl` as `rewritten_sql`.
 
@@ -508,6 +508,7 @@ There is one engine, **local PySpark 4.2 with delta-spark**, and two tools:
   - The host treats every response as untrusted: it validates it with pydantic and rejects lines larger than `MAX_RESPONSE_BYTES` (`config.py`).
 - **Logs:** Spark's log level is `WARN`. Python stdout and stderr are captured per run into `RunResult` (8 KB each). JVM logs go to the container's stderr and are kept by Docker (`docker logs <container>`), with no extra code.
 - **Per-run timeout:** `run_timeout`. It counts only the time the code runs, not time spent waiting for the lock (§9.5). On timeout the container is killed and restarted, and the run is recorded as `TIMEOUT`. Tables survive (metastore); temp views and cached data are lost.
+  - A broken answer (larger than `MAX_RESPONSE_BYTES`, or the output closed) stops the container the same way, because its output may be out of step. `restart_executor` starts the same container again on a new connection.
 - **Container limit:** at most `max_containers` (default `2`) executor containers run at once, counted by the label `dbrix.sandbox_id=<id>` across all host processes. To start a new one when the limit is reached, the client stops the least recently used container that is not running a run. Its sandbox stays on disk and its container restarts on demand.
   - If every container is busy running a run, the call **waits** for a free slot, up to `run_timeout`. If none frees up in time, the agent gets an error `ToolMessage`: "executor busy, try again". This wait does not count toward the call's own run timeout. In async code it happens in the worker thread (§8.2).
 
@@ -918,3 +919,5 @@ For each case: the policy should block it (this is the feedback layer). Separate
 | 49 | Policy-disabled red-team runs | — | The wrapper is passed to the runtime at startup; containment tests run without it (raw Spark), the strictest case. No flag the agent can reach |
 | 50 | Container limit | Phase 4 | Built with locking in Phase 5 (§12 step 5). Phase 4 runs one container per sandbox: start, run, timeout, restart |
 | 51 | Executor `/tmp` | `rw,size=1g` | `rw,exec,nosuid,size=1g`: Docker's tmpfs default is `noexec`, and Spark's snappy/lz4/zstd load a native library they unpack into `/tmp`. No new capability: `/sandbox` already allows exec |
+| 52 | Temp view after a restart | Spark's "not found" error | Blocked as an unknown 1-part name (`TABLE_NAME_NOT_ALLOWED`): the wrapper can't tell a lost view from a wrong name |
+| 53 | Broken executor answer | — | The container is stopped, as on timeout, and restarted in place |
